@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Tapedeck
+GenericName=Playlist Builder
+Comment=Sort YouTube songs into categories and play them with mpv
+Exec=tapedeck
+Icon=tapedeck
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=youtube;playlist;music;mpv;

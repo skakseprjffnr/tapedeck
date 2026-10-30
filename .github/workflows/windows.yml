@@ -1,0 +1,41 @@
+# Builds the Windows version on GitHub's Windows machines.
+#   Actions tab → "Windows build" → Run workflow: download the result under "Artifacts".
+#   Pushing a tag like v0.5.0 also attaches the files to that release.
+name: Windows build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write  # lets tag builds attach files to their release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build the installer and the portable zip
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # avoids GitHub's API rate limit for the mpv lookup
+        run: ./windows/build.ps1
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: Tapedeck-windows
+          path: windows/out/*
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: windows/out/*

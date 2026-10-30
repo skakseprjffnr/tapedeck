@@ -1,0 +1,6 @@
+__pycache__/
+build/
+windows/out/
+*.pkg.tar.zst
+src/
+pkg/
