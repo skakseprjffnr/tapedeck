@@ -17,6 +17,7 @@ Log:     ~/.local/state/tapedeck/tapedeck.log
 """
 from __future__ import annotations
 
+import base64
 import contextlib
 import glob
 import heapq
@@ -32,6 +33,7 @@ import sys
 import tempfile
 import time
 import uuid
+import zlib
 from collections import deque
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
@@ -44,7 +46,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QColor, QCursor, QFont, QFontMetrics, QIcon, QIntValidator, QKeySequence,
-    QPainter, QPainterPath, QPalette, QPen, QPixmap, QShortcut,
+    QPainter, QPainterPath, QPalette, QPen, QPixmap, QShortcut, QTextOption,
 )
 from PySide6.QtNetwork import (
     QLocalSocket, QNetworkAccessManager, QNetworkReply, QNetworkRequest,
@@ -52,14 +54,15 @@ from PySide6.QtNetwork import (
 from PySide6.QtWidgets import (
     QAbstractButton, QApplication, QFrame, QGraphicsDropShadowEffect,
     QGraphicsOpacityEffect, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QMenu, QPushButton, QScrollArea, QSizePolicy, QStackedWidget, QVBoxLayout,
+    QMainWindow, QMenu, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QStackedWidget,
+    QVBoxLayout,
     QWidget,
 )
 
 APP_NAME = "Tapedeck"
 APP_ID = "tapedeck"
 IS_WINDOWS = sys.platform == "win32"
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 # ── Design tokens ────────────────────────────────────────────────────────────
 # Strict black and white. The accent only marks actions and what is playing.
@@ -70,10 +73,16 @@ ASH = "#5f5f5f"          # tertiary text, idle icons
 HAIRLINE = "#262626"     # card and field borders
 HAIRLINE_HI = "#3a3a3a"  # hovered borders
 HOVER = "#141414"        # hover fill (a state, never a surface)
+# The accent is customizable (Settings). These are the default's hand-tuned
+# shades; set_accent() derives matching ones for any other color.
+DEFAULT_ACCENT = "#4592a2"
 ACCENT = "#4592a2"
-ACCENT_HI = "#56a7b8"
-ACCENT_LO = "#387985"
-ACCENT_WASH = "#0c1a1d"  # accent mixed into black: playing / selected rows
+ACCENT_HI = "#56a7b8"     # hover
+ACCENT_LO = "#387985"     # pressed
+ACCENT_WASH = "#0c1a1d"   # accent mixed into black: playing / selected rows
+ACCENT_DIM_BG = "#17292d"  # disabled accent button
+ACCENT_DIM_FG = "#4f6c72"
+ON_ACCENT = BLACK          # text and glyphs drawn on the accent
 
 ROW_H = 52
 ROW_H_WIDE = 62       # rows on a category's own page
@@ -82,6 +91,60 @@ ROW_GAP = 2
 MAX_VISIBLE_ROWS = 8     # longer categories scroll inside their card
 
 SANS = ["IBM Plex Sans", "Segoe UI", "Noto Sans", "Cantarell", "DejaVu Sans"]
+
+def parse_hex(text: str) -> str | None:
+    """"#4592a2", "4592a2" or "#49a" → "#4592a2" style; None if it isn't a color."""
+    value = text.strip().lstrip("#")
+    if re.fullmatch(r"[0-9a-fA-F]{3}", value):
+        value = "".join(ch * 2 for ch in value)
+    return "#" + value.lower() if re.fullmatch(r"[0-9a-fA-F]{6}", value) else None
+
+
+def _rgb(color: str) -> tuple[int, int, int]:
+    return int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+
+
+def mix(a: str, b: str, amount: float) -> str:
+    """a moved amount (0 to 1) of the way toward b."""
+    return "#" + "".join(f"{max(0, min(255, round(x + (y - x) * amount))):02x}"
+                         for x, y in zip(_rgb(a), _rgb(b)))
+
+
+def luminance(color: str) -> float:
+    def channel(value: int) -> float:
+        c = value / 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = (channel(v) for v in _rgb(color))
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def contrast(a: str, b: str) -> float:
+    """WCAG contrast ratio, 1 (none) to 21 (black on white)."""
+    high, low = sorted((luminance(a), luminance(b)), reverse=True)
+    return (high + 0.05) / (low + 0.05)
+
+
+def accent_palette(color: str) -> dict[str, str]:
+    if color == DEFAULT_ACCENT:
+        return {"ACCENT": color, "ACCENT_HI": "#56a7b8", "ACCENT_LO": "#387985",
+                "ACCENT_WASH": "#0c1a1d", "ACCENT_DIM_BG": "#17292d", "ACCENT_DIM_FG": "#4f6c72",
+                "ON_ACCENT": BLACK}
+    return {
+        "ACCENT": color,
+        "ACCENT_HI": mix(color, WHITE, 0.16),
+        "ACCENT_LO": mix(color, BLACK, 0.18),
+        "ACCENT_WASH": mix(BLACK, color, 0.17),
+        "ACCENT_DIM_BG": mix(BLACK, color, 0.3),
+        "ACCENT_DIM_FG": mix(color, ASH, 0.5),
+        "ON_ACCENT": BLACK if contrast(color, BLACK) >= contrast(color, WHITE) else WHITE,
+    }
+
+
+def set_accent(color: str) -> str:
+    """Use this accent everywhere (widgets built afterwards, and the stylesheet)."""
+    globals().update(accent_palette(parse_hex(color) or DEFAULT_ACCENT))
+    return ACCENT
+
 
 # ── Zoom ─────────────────────────────────────────────────────────────────────
 # Every size in this file is in "design pixels" at 100%. z() converts to real
@@ -429,6 +492,7 @@ class Category:
     title: str
     subtitle: str = ""
     song_ids: list[str] = field(default_factory=list)
+    share_id: str = ""  # the same in every copy made from share codes, so updates are recognized
 
 
 class Library(QObject):
@@ -469,6 +533,7 @@ class Library(QObject):
                     title=raw.get("title", "Untitled"),
                     subtitle=raw.get("subtitle", ""),
                     song_ids=[sid for sid in raw.get("songs", []) if sid in self.songs],
+                    share_id=str(raw.get("share_id") or ""),
                 ))
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             backup = self.path.with_name(f"library.broken-{int(time.time())}.json")
@@ -497,7 +562,8 @@ class Library(QObject):
                 for sid, song in self.songs.items()
             },
             "categories": [
-                {"id": c.id, "title": c.title, "subtitle": c.subtitle, "songs": c.song_ids}
+                {"id": c.id, "title": c.title, "subtitle": c.subtitle, "songs": c.song_ids,
+                 **({"share_id": c.share_id} if c.share_id else {})}
                 for c in self.categories
             ],
         }
@@ -587,9 +653,9 @@ class Library(QObject):
             video_id = entry["video_id"]
             song = by_video.get(video_id)
             if song is None:
-                song = Song(id=new_id(), video_id=video_id, yt_title=entry.get("title") or "",
-                            channel=entry.get("channel") or "", duration=entry.get("duration"),
-                            added=now)
+                song = Song(id=new_id(), video_id=video_id, title=entry.get("custom") or "",
+                            yt_title=entry.get("title") or "", channel=entry.get("channel") or "",
+                            duration=entry.get("duration"), added=now)
                 self.songs[song.id] = song
                 by_video[video_id] = song
             if song.id not in ordered:
@@ -607,6 +673,66 @@ class Library(QObject):
         for category_id in added:
             self.categorySongsChanged.emit(category_id)
         return added
+
+    def category_by_share(self, share_id: str) -> Category | None:
+        return next((c for c in self.categories if share_id and c.share_id == share_id), None)
+
+    def ensure_share_id(self, category_id: str) -> str:
+        category = self.category(category_id)
+        if category is None:
+            return ""
+        if not category.share_id:
+            category.share_id = new_id()
+            self.save()
+        return category.share_id
+
+    def replace_category_songs(self, category_id: str, entries: list[dict], *,
+                               title: str = "", subtitle: str | None = None) -> tuple[int, int]:
+        """Make a category match a newer share code exactly: its songs, order, titles and name.
+
+        Returns (songs added, songs removed).
+        """
+        category = self.category(category_id)
+        if category is None:
+            return 0, 0
+        here = {self.songs[sid].video_id: self.songs[sid] for sid in category.song_ids
+                if sid in self.songs}
+        elsewhere: dict[str, Song] = {}
+        for song in self.songs.values():
+            elsewhere.setdefault(song.video_id, song)
+        new_ids: list[str] = []
+        added = 0
+        for entry in entries:
+            video_id = entry["video_id"]
+            song = here.get(video_id) or elsewhere.get(video_id)
+            if song is None:
+                song = Song(id=new_id(), video_id=video_id, title=entry.get("custom") or "",
+                            yt_title=entry.get("title") or "", channel=entry.get("channel") or "",
+                            duration=entry.get("duration"), added=time.time())
+                self.songs[song.id] = song
+            else:
+                song.title = entry.get("custom") or ""  # their renames come along
+                if song.duration is None and entry.get("duration"):
+                    song.duration = entry["duration"]
+            if video_id not in here:
+                added += 1
+            if song.id not in new_ids:
+                new_ids.append(song.id)
+        kept = {entry["video_id"] for entry in entries}
+        removed = sum(1 for video_id in here if video_id not in kept)
+        category.song_ids = new_ids
+        renamed = False
+        if title and title != category.title:
+            category.title, renamed = title[:80], True
+        if subtitle is not None and subtitle != category.subtitle:
+            category.subtitle, renamed = subtitle[:140], True
+        self.save()
+        self.categorySongsChanged.emit(category_id)
+        if renamed:
+            self.categoryRenamed.emit(category_id)
+        for song_id in new_ids:
+            self.songChanged.emit(song_id)
+        return added, removed
 
     def has_video(self, category_id: str, video_id: str) -> bool:
         category = self.category(category_id)
@@ -720,11 +846,12 @@ class MetaFetcher(QObject):
     def is_pending(self, video_id: str) -> bool:
         return self._pending.get(video_id, 0) > 0
 
-    def request(self, video_id: str) -> None:
+    def request(self, video_id: str, need_duration: bool = True) -> None:
         if self.is_pending(video_id):
             return
         entry = self.info.get(video_id)
-        if entry and entry["title"] and (entry["duration"] is not None or not self.has_ytdlp):
+        if entry and entry["title"] and (entry["duration"] is not None or not self.has_ytdlp
+                                         or not need_duration):
             return
         if entry is None:
             entry = self.info[video_id] = {
@@ -732,6 +859,8 @@ class MetaFetcher(QObject):
         entry["error"] = None
         self._pending[video_id] = 0
         self._start_oembed(video_id)
+        if not need_duration:
+            return
         if self.has_ytdlp:
             self._pending[video_id] += 1
             self._queue.append(video_id)
@@ -894,6 +1023,9 @@ class PlaylistJob(QObject):
         self.channel = ""
         self.entries: list[dict] = []
         self.unavailable = 0
+        self.kind = "playlist"  # the same fields as an ImportBatch, so either can be imported
+        self.subtitle = ""
+        self.share_id = ""
         self.error = ""
         self.cancelled = False
         self._process: QProcess | None = None
@@ -994,6 +1126,117 @@ def import_summary(library: Library, added: dict[str, int], total: int, unavaila
     if unavailable:
         text += f" {unavailable} unavailable video{'' if unavailable == 1 else 's'} left out."
     return text
+
+
+# ── Sharing ──────────────────────────────────────────────────────────────────
+# A share code is the category as compact JSON, compressed and made text-safe:
+#   tapedeck:1:<base64url of zlib(JSON)>
+# JSON: {"i": share id, "n": name, "d": subtitle, "s": [[video id, seconds, renamed title], …]}
+SHARE_PREFIX = "tapedeck:1:"
+MAX_SHARED_SONGS = 5000
+MAX_SHARE_BYTES = 2_000_000  # after decompression; refuses "zip bombs"
+
+
+@dataclass
+class ImportBatch:
+    """Songs to import that didn't come from a YouTube playlist: a share code or pasted links."""
+    title: str
+    channel: str
+    entries: list[dict]
+    kind: str               # "code" or "links"
+    subtitle: str = ""
+    share_id: str = ""
+    unavailable: int = 0
+
+
+def make_share_code(library: Library, category: Category) -> str:
+    songs = []
+    for song in (library.song(sid) for sid in category.song_ids):
+        if song is None:
+            continue
+        item: list = [song.video_id, int(song.duration or 0)]
+        if song.title:
+            item.append(song.title)
+        songs.append(item)
+    payload = {"i": category.share_id, "n": category.title, "d": category.subtitle, "s": songs}
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    packed = base64.urlsafe_b64encode(zlib.compress(raw, 9)).decode("ascii").rstrip("=")
+    return SHARE_PREFIX + packed
+
+
+def looks_like_share_code(text: str) -> bool:
+    return "".join(text.split())[:len(SHARE_PREFIX)].lower() == SHARE_PREFIX
+
+
+def read_share_code(text: str) -> ImportBatch | None:
+    """The category in a share code, or None if it's damaged or incomplete."""
+    compact = "".join(text.split())  # chat apps sometimes wrap long codes
+    if not looks_like_share_code(compact):
+        return None
+    body = compact[len(SHARE_PREFIX):]
+    if not body or not re.fullmatch(r"[A-Za-z0-9_-]+", body):
+        return None
+    try:
+        packed = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))
+        inflater = zlib.decompressobj()
+        raw = inflater.decompress(packed, MAX_SHARE_BYTES)
+        if inflater.unconsumed_tail:
+            return None
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, zlib.error, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("s"), list):
+        return None
+    text_of = lambda value, limit: value.strip()[:limit] if isinstance(value, str) else ""
+    entries: list[dict] = []
+    seen: set[str] = set()
+    for item in data["s"]:
+        if isinstance(item, str):
+            item = [item]
+        if not isinstance(item, list) or not item or not isinstance(item[0], str):
+            continue
+        video_id = item[0]
+        if not VIDEO_ID.fullmatch(video_id) or video_id in seen:
+            continue
+        seen.add(video_id)
+        seconds = item[1] if len(item) > 1 else 0
+        valid = isinstance(seconds, int) and not isinstance(seconds, bool) and 0 < seconds < 360_000
+        entries.append({"video_id": video_id, "title": "", "channel": "",
+                        "duration": seconds if valid else None,
+                        "custom": text_of(item[2], 200) if len(item) > 2 else ""})
+        if len(entries) >= MAX_SHARED_SONGS:
+            break
+    share_id = data.get("i") if isinstance(data.get("i"), str) else ""
+    return ImportBatch(title=text_of(data.get("n"), 80) or "Shared playlist",
+                       channel="a Tapedeck share code", entries=entries, kind="code",
+                       subtitle=text_of(data.get("d"), 140),
+                       share_id=share_id if re.fullmatch(r"[0-9a-f]{12}", share_id or "") else "")
+
+
+def song_links(library: Library, category: Category) -> str:
+    return "\n".join(watch_url(song.video_id) for song in
+                     (library.song(sid) for sid in category.song_ids) if song is not None)
+
+
+def parse_link_list(text: str) -> list[str]:
+    """Video ids from pasted links (one per line, or separated by spaces or commas)."""
+    found: list[str] = []
+    for token in re.split(r"[\s,;]+", text.strip()):
+        video_id = parse_video_id(token) if token else None
+        if video_id and video_id not in found:
+            found.append(video_id)
+    return found
+
+
+def update_summary(added: int, removed: int, name: str) -> str:
+    if not added and not removed:
+        return f"“{name}” already matched."
+    parts = []
+    if added:
+        parts.append(f"added {song_count(added)}")
+    if removed:
+        parts.append(f"removed {song_count(removed)}")
+    return f"Updated “{name}”: " + " and ".join(parts) + "."
 
 
 # ── Thumbnails ───────────────────────────────────────────────────────────────
@@ -1616,13 +1859,13 @@ class ResolveJob(QObject):
         self.done.emit(self)
 
 
-def mpv_launch_args(socket_path: str, volume: int, muted: bool) -> list[str]:
+def mpv_launch_args(socket_path: str, volume: int, muted: bool, loop: bool = False) -> list[str]:
     """One background mpv for the whole session, audio only, driven over IPC."""
     return [
         "--idle=yes", f"--input-ipc-server={socket_path}",
         "--no-video", "--ytdl=no", "--input-terminal=no", "--msg-level=all=warn",
         "--force-window=no", "--audio-display=no", "--keep-open=no",
-        "--loop-file=no", "--loop-playlist=no", "--shuffle=no",
+        f"--loop-file={'inf' if loop else 'no'}", "--loop-playlist=no", "--shuffle=no",
         "--save-position-on-quit=no", "--resume-playback=no",
         "--gapless-audio=weak", "--prefetch-playlist=yes", "--network-timeout=20",
         f"--audio-client-name={APP_NAME}", "--volume-max=100",
@@ -1640,7 +1883,7 @@ class MpvIpc(QObject):
     died = Signal(str)      # why, in a sentence
 
     OBSERVED = ("time-pos", "duration", "pause", "volume", "mute", "seekable",
-                "paused-for-cache")
+                "paused-for-cache", "loop-file")
     CONNECT_TRIES = 75
     RETRY_MS = 80
 
@@ -1651,7 +1894,7 @@ class MpvIpc(QObject):
         else:
             runtime = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
             self.socket_path = str(Path(runtime) / f"tapedeck-mpv-{os.getpid()}.sock")
-        self.volume, self.muted = 80, False  # used whenever mpv (re)starts
+        self.volume, self.muted, self.loop = 80, False, False  # used whenever mpv (re)starts
         self._process: QProcess | None = None
         self._socket: QLocalSocket | None = None
         self._connected = False
@@ -1685,7 +1928,7 @@ class MpvIpc(QObject):
         process = QProcess(self)
         process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         process.setProgram(tool("mpv"))
-        process.setArguments(mpv_launch_args(self.socket_path, self.volume, self.muted))
+        process.setArguments(mpv_launch_args(self.socket_path, self.volume, self.muted, self.loop))
         process.readyReadStandardOutput.connect(lambda p=process: self._output_ready(p))
         process.finished.connect(lambda code, _status, p=process: self._finished(p, code))
         process.errorOccurred.connect(lambda error, p=process: self._error(p, error))
@@ -1873,8 +2116,9 @@ class SongEngine(QObject):
         self.settings = settings
         self.volume = int(max(0, min(100, settings.get("volume", 80))))
         self.muted = bool(settings.get("muted", False))
+        self.repeat_one = bool(settings.get("repeat_one", False))
         self.mpv = mpv if mpv is not None else MpvIpc(self)
-        self.mpv.volume, self.mpv.muted = self.volume, self.muted
+        self.mpv.volume, self.mpv.muted, self.mpv.loop = self.volume, self.muted, self.repeat_one
         self.mpv.received.connect(self._event)
         self.mpv.died.connect(self._mpv_died)
         cache.saved.connect(self._saved)
@@ -2006,6 +2250,16 @@ class SongEngine(QObject):
         if self.mpv.running:
             self.mpv.set_property("mute", muted)
         self._persist.start()
+        self.stateChanged.emit()
+
+    def set_repeat(self, on: bool) -> None:
+        """Play the current song over and over (mpv loops it; nothing else changes)."""
+        if on == self.repeat_one:
+            return
+        self.repeat_one = self.mpv.loop = on
+        if self.mpv.running:
+            self.mpv.set_property("loop-file", "inf" if on else "no")
+        self.settings.set("repeat_one", on)
         self.stateChanged.emit()
 
     def shutdown(self) -> None:
@@ -2244,6 +2498,12 @@ class SongEngine(QObject):
         elif name == "paused-for-cache":
             self.buffering = bool(value)
             self.stateChanged.emit()
+        elif name == "loop-file":  # e.g. changed through media controls
+            on = value not in (False, None, "no", 0)
+            if on != self.repeat_one:
+                self.repeat_one = self.mpv.loop = on
+                self.settings.set("repeat_one", on)
+                self.stateChanged.emit()
 
     def _look_ahead(self) -> None:
         """Near the end of a song, make sure an unsaved next song can still start quickly."""
@@ -2446,6 +2706,19 @@ class Player(QObject):
     @property
     def muted(self) -> bool:
         return self.engine.muted
+
+    @property
+    def repeat_one(self) -> bool:
+        return self.engine.repeat_one
+
+    def toggle_repeat(self) -> None:
+        self.engine.set_repeat(not self.engine.repeat_one)
+
+    def toggle_shuffle(self) -> None:
+        """The bottom bar's shuffle: flips shuffle for the category that's playing."""
+        q = self.queue
+        if q is not None and q.mode != "single":
+            self.set_shuffle(q.category_id, q.mode != "shuffle")
 
     def timing(self) -> tuple[float | None, float | None]:
         """Where the current song is, and how long it is."""
@@ -2738,7 +3011,7 @@ class Player(QObject):
 
 
 # ── Painted pieces ───────────────────────────────────────────────────────────
-def painted_icon(kind: str, color: str = ACCENT, size: int = 18) -> QIcon:
+def painted_icon(kind: str, color: str | None = None, size: int = 18) -> QIcon:
     """Small icons for the + menu, drawn in code so no icon theme is needed."""
     ratio = 3
     pixmap = QPixmap(size * ratio, size * ratio)
@@ -2747,7 +3020,7 @@ def painted_icon(kind: str, color: str = ACCENT, size: int = 18) -> QIcon:
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     painter.scale(ratio * size / 18, ratio * size / 18)
     painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QColor(color))
+    painter.setBrush(QColor(color or ACCENT))
     if kind == "song":  # an eighth note
         painter.drawEllipse(QRectF(2.6, 11.0, 7.4, 5.6))
         painter.drawRect(QRectF(8.4, 2.4, 1.7, 11.6))
@@ -2781,7 +3054,7 @@ def app_icon() -> QIcon:
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(ACCENT))
         painter.drawRoundedRect(QRectF(4, 4, 56, 56), 15, 15)
-        painter.setBrush(QColor(BLACK))
+        painter.setBrush(QColor(ON_ACCENT))
         for y in (21.75, 30.25, 38.75):
             painter.drawRoundedRect(QRectF(14, y, 18, 3.5), 1.75, 1.75)
         triangle = QPainterPath(QPointF(38, 21))
@@ -2811,7 +3084,9 @@ class FabButton(QAbstractButton):
         glow = QGraphicsDropShadowEffect(self)
         glow.setBlurRadius(z(30))
         glow.setOffset(0, z(6))
-        glow.setColor(QColor(69, 146, 162, 95))
+        glow_color = QColor(ACCENT)
+        glow_color.setAlpha(95)
+        glow.setColor(glow_color)
         self.setGraphicsEffect(glow)
 
     def _set_angle(self, value) -> None:
@@ -2840,7 +3115,7 @@ class FabButton(QAbstractButton):
         painter.drawRoundedRect(QRectF(0, 0, w, h), 17, 17)
         painter.translate(w / 2, h / 2)
         painter.rotate(self._angle)
-        painter.setPen(QPen(QColor(BLACK), 2.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.setPen(QPen(QColor(ON_ACCENT), 2.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         arm = 10.0
         painter.drawLine(QPointF(-arm, 0), QPointF(arm, 0))
         painter.drawLine(QPointF(0, -arm), QPointF(0, arm))
@@ -2960,7 +3235,7 @@ class PlayButton(QAbstractButton):
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(ACCENT_HI if hover else ACCENT))
             painter.drawEllipse(ring)
-            draw_glyph(painter, "stop", center, QColor(BLACK), scale=0.9)
+            draw_glyph(painter, "stop", center, QColor(ON_ACCENT), scale=0.9)
         elif self._phase == "loading":
             track = ring.adjusted(1, 1, -1, -1)
             painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -2979,7 +3254,7 @@ class PlayButton(QAbstractButton):
                 painter.setPen(QPen(QColor(HAIRLINE_HI), 1))
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawEllipse(ring.adjusted(0.5, 0.5, -0.5, -0.5))
-            draw_glyph(painter, "play", center, QColor(BLACK if hover else WHITE), scale=0.92)
+            draw_glyph(painter, "play", center, QColor(ON_ACCENT if hover else WHITE), scale=0.92)
 
 
 def triangle(a: QPointF, b: QPointF, c: QPointF) -> QPainterPath:
@@ -3024,6 +3299,50 @@ def draw_glyph(painter: QPainter, kind: str, center: QPointF, color: QColor,
         elif kind == "prev":
             painter.drawPath(triangle(QPointF(5.2, -5.4), QPointF(5.2, 5.4), QPointF(-3.2, 0.0)))
             painter.drawRoundedRect(QRectF(-5.6, -5.4, 2.0, 10.8), 0.8, 0.8)
+        elif kind == "repeat":
+            painter.setPen(QPen(color, 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                                Qt.PenJoinStyle.RoundJoin))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            top = QPainterPath(QPointF(-6.5, 1.0))
+            top.lineTo(-6.5, -1.5)
+            top.quadTo(QPointF(-6.5, -4.2), QPointF(-3.8, -4.2))
+            top.lineTo(5.6, -4.2)
+            painter.drawPath(top)
+            painter.drawPath(triangle(QPointF(3.6, -6.2), QPointF(5.8, -4.2), QPointF(3.6, -2.2)))
+            bottom = QPainterPath(QPointF(6.5, -1.0))
+            bottom.lineTo(6.5, 1.5)
+            bottom.quadTo(QPointF(6.5, 4.2), QPointF(3.8, 4.2))
+            bottom.lineTo(-5.6, 4.2)
+            painter.drawPath(bottom)
+            painter.drawPath(triangle(QPointF(-3.6, 2.2), QPointF(-5.8, 4.2), QPointF(-3.6, 6.2)))
+            painter.setPen(QPen(color, 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            painter.drawLine(QPointF(0.5, -1.9), QPointF(0.5, 1.9))   # the "1"
+            painter.drawLine(QPointF(-0.7, -0.9), QPointF(0.5, -1.9))
+        elif kind == "share":
+            painter.setPen(QPen(color, 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                                Qt.PenJoinStyle.RoundJoin))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            tray = QPainterPath(QPointF(-5.6, 0.6))
+            tray.lineTo(-5.6, 5.4)
+            tray.lineTo(5.6, 5.4)
+            tray.lineTo(5.6, 0.6)
+            painter.drawPath(tray)
+            painter.drawLine(QPointF(0.0, 2.2), QPointF(0.0, -6.0))
+            head = QPainterPath(QPointF(-3.1, -3.0))
+            head.lineTo(0.0, -6.1)
+            head.lineTo(3.1, -3.0)
+            painter.drawPath(head)
+        elif kind == "settings":
+            ring = QPainterPath()
+            ring.setFillRule(Qt.FillRule.OddEvenFill)
+            ring.addEllipse(QPointF(0.0, 0.0), 5.0, 5.0)
+            ring.addEllipse(QPointF(0.0, 0.0), 2.2, 2.2)
+            painter.drawPath(ring)
+            for tooth in range(8):
+                painter.save()
+                painter.rotate(45 * tooth)
+                painter.drawRoundedRect(QRectF(-1.5, -7.3, 3.0, 3.2), 0.7, 0.7)
+                painter.restore()
         elif kind == "pause":
             painter.drawRoundedRect(QRectF(-4.6, -5.6, 3.4, 11.2), 1.0, 1.0)
             painter.drawRoundedRect(QRectF(1.2, -5.6, 3.4, 11.2), 1.0, 1.0)
@@ -3101,16 +3420,19 @@ class GlyphButton(QAbstractButton):
         if self.variant == "primary":
             if enabled:
                 fill = QColor(ACCENT_LO if self.isDown() else ACCENT_HI if hover else ACCENT)
-                glyph = QColor(BLACK)
+                glyph = QColor(ON_ACCENT)
             else:
-                fill, glyph = QColor("#17292d"), QColor("#4f6c72")
+                fill, glyph = QColor(ACCENT_DIM_BG), QColor(ACCENT_DIM_FG)
         elif not enabled:
             glyph = QColor(HAIRLINE_HI)
             edge = QColor(HAIRLINE) if self.variant != "bare" else None
         elif self._active and self.variant == "outline":
-            fill, glyph = QColor(ACCENT_HI if hover else ACCENT), QColor(BLACK)
+            fill, glyph = QColor(ACCENT_HI if hover else ACCENT), QColor(ON_ACCENT)
         elif self._active and self.variant == "toggle":
             fill, edge, glyph = QColor(ACCENT_WASH), QColor(ACCENT), QColor(ACCENT)
+        elif self._active and self.variant == "bare":
+            glyph = QColor(ACCENT_HI if hover else ACCENT)
+            fill = QColor(HOVER) if hover else None
         else:
             if hover:
                 fill = QColor(HOVER)
@@ -3122,6 +3444,10 @@ class GlyphButton(QAbstractButton):
         painter.setBrush(fill if fill is not None else Qt.BrushStyle.NoBrush)
         painter.drawRoundedRect(frame, self._radius, self._radius)
         draw_glyph(painter, self.kind, QRectF(0, 0, w, h).center(), glyph)
+        if self._active and self.variant == "bare" and enabled:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(glyph)
+            painter.drawEllipse(QPointF(w / 2, h - 4.0), 1.6, 1.6)
 
 
 class SeekBar(QWidget):
@@ -3521,6 +3847,15 @@ class CheckRow(QAbstractButton):
     def sizeHint(self) -> QSize:
         return QSize(z(320), self.height())
 
+    def set_text(self, title: str, subtitle: str = "") -> None:
+        self._title, self._subtitle = title, subtitle
+        self.update()
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.EnabledChange:
+            self.update()
+
     def enterEvent(self, event) -> None:
         self.update()
         super().enterEvent(event)
@@ -3531,6 +3866,8 @@ class CheckRow(QAbstractButton):
 
     def paintEvent(self, _event) -> None:
         painter, w, h = zoomed_painter(self)
+        if not self.isEnabled():
+            painter.setOpacity(0.35)
         frame = QRectF(0, 0, w, h).adjusted(0.5, 0.5, -0.5, -0.5)
         checked, hover = self.isChecked(), self.underMouse()
         if checked:
@@ -3550,7 +3887,7 @@ class CheckRow(QAbstractButton):
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(ACCENT))
             painter.drawRoundedRect(box, 5, 5)
-            painter.setPen(QPen(QColor(BLACK), 2.2, Qt.PenStyle.SolidLine,
+            painter.setPen(QPen(QColor(ON_ACCENT), 2.2, Qt.PenStyle.SolidLine,
                                 Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             tick = QPainterPath(QPointF(box.left() + 4.6, box.center().y() + 0.3))
@@ -4074,12 +4411,18 @@ class CategoryCard(QFrame):
         toggle_category_shuffle(self.ctx.player, self.category_id)
 
     def _context_menu(self, pos: QPoint) -> None:
+        category = self.ctx.library.category(self.category_id)
         menu = QMenu(self)
         rename = menu.addAction("Rename category")
+        share = menu.addAction("Share or export…")
+        share.setEnabled(bool(category and category.song_ids))
+        menu.addSeparator()
         delete = menu.addAction("Delete category…")
         chosen = menu.exec(self.mapToGlobal(pos))
         if chosen == rename:
             self.title.begin()
+        elif chosen == share and self.ctx.window is not None:
+            self.ctx.window.open_share(self.category_id)
         elif chosen == delete and self.ctx.window is not None:
             self.ctx.window.confirm_delete_category(self.category_id)
 
@@ -4399,7 +4742,6 @@ LIST_NOTE = ("Only this video is added. To add the whole playlist, use Import Pl
              "in the + menu.")
 PLAYLIST_LINK_ERROR = ("That's a playlist link. Use Import Playlist in the + menu to add all "
                        "of its songs.")
-PLAYLIST_HINT = "Public and unlisted playlists work. Copy the link from the playlist's Share button."
 
 
 class SongSheet(Sheet):
@@ -4542,17 +4884,56 @@ class SongSheet(Sheet):
             self.cancelled.emit()
 
 
-class PlaylistSheet(Sheet):
-    """Step 1: the playlist's link. Step 2: which categories get its songs."""
+IMPORT_HINT = ("Paste a YouTube playlist link, a Tapedeck share code, or YouTube links (one per "
+               "line). Public and unlisted playlists work.")
+SINGLE_VIDEO_HINT = ("That's a link to a single video. Use Add Song for that, or paste more "
+                     "links, one per line.")
+NOT_IMPORTABLE_HINT = "That isn't a playlist link, a share code or a list of YouTube links."
+BROKEN_CODE_HINT = "That share code is incomplete or damaged. Ask for it again, and copy all of it."
 
-    submitted = Signal(object, str, list)  # finished PlaylistJob, new category name or "", category ids
+
+class PasteBox(QPlainTextEdit):
+    """A few lines of text: long share codes and lists of links fit without scrolling sideways."""
+
+    def __init__(self, placeholder: str = "", read_only: bool = False,
+                 parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("PasteBox")
+        self.setFont(make_font(13))
+        self.setPlaceholderText(placeholder)
+        self.setReadOnly(read_only)
+        self.setTabChangesFocus(True)
+        self.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        self.setFixedHeight(z(88))
+
+
+def share_diff(library: Library, category: Category, entries: list[dict]) -> tuple[int, int]:
+    """(new songs, removed songs) if this category were updated to match entries."""
+    here = {song.video_id for song in (library.song(sid) for sid in category.song_ids) if song}
+    there = {entry["video_id"] for entry in entries}
+    return len(there - here), len(here - there)
+
+
+def diff_text(new: int, removed: int) -> str:
+    if not new and not removed:
+        return "no song changes"
+    parts = ([f"{new} new"] if new else []) + ([f"{removed} removed"] if removed else [])
+    return ", ".join(parts)
+
+
+class PlaylistSheet(Sheet):
+    """Import a YouTube playlist, a share code or pasted links, then choose where they go."""
+
+    # source (PlaylistJob or ImportBatch), new category name or "", category ids, category to update
+    submitted = Signal(object, str, list, str)
 
     def __init__(self, ctx: Ctx, preselect: str = "") -> None:
         super().__init__("Import playlist", "1 of 2")
         self.ctx = ctx
         self.job: PlaylistJob | None = None
-        self.result: PlaylistJob | None = None
-        self._key: tuple[str, str] | None = None
+        self.result = None          # a finished PlaylistJob, or an ImportBatch
+        self.match: Category | None = None  # the category a share code is a newer copy of
+        self._key = None
         self._thumb_id = ""
         self._named = False  # the new category's name was typed by hand
         self._step = 1
@@ -4561,43 +4942,57 @@ class PlaylistSheet(Sheet):
         first = QVBoxLayout(self.step1)
         first.setContentsMargins(0, 0, 0, 0)
         first.setSpacing(z(16))
-        link_box, self.link_input, self.link_hint = make_field(
-            "Playlist link", "https://www.youtube.com/playlist?list=…", hint=PLAYLIST_HINT)
+        box = QWidget()
+        column = QVBoxLayout(box)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(z(7))
+        column.addWidget(plain_label("Playlist link, share code or links", "FieldLabel",
+                                     make_font(13, QFont.Weight.Medium)))
+        self.link_input = PasteBox("https://www.youtube.com/playlist?list=…")
+        column.addWidget(self.link_input)
+        self.link_hint = plain_label(IMPORT_HINT, "FieldHint", make_font(12))
+        self.link_hint.setWordWrap(True)
+        column.addWidget(self.link_hint)
         self.preview = VideoPreview()
         self.preview.hide()
-        first.addWidget(link_box)
+        first.addWidget(box)
         first.addWidget(self.preview)
 
         self.step2 = QWidget()
         second = QVBoxLayout(self.step2)
         second.setContentsMargins(0, 0, 0, 0)
         second.setSpacing(z(10))
-        intro = plain_label("Its songs go to the top of each category you tick, in playlist order.",
+        intro = plain_label("Its songs go to the top of each category you tick, in order.",
                             "FieldHint", make_font(13))
         intro.setWordWrap(True)
         second.addWidget(intro)
+        self.update_check = CheckRow("", "Update", "Match the share code")
+        self.update_check.hide()
         self.new_check = CheckRow("", "New category", "Named after the playlist")
         self.name_input = QLineEdit()
         self.name_input.setPlaceholderText("Category name")
         self.name_input.setFont(make_font(14))
         self.name_input.setMaxLength(80)
+        second.addWidget(self.update_check)
         second.addWidget(self.new_check)
         second.addWidget(self.name_input)
         self.picker = CategoryPicker(ctx.library, checked={preselect}, visible_rows=4)
         self.picker.changed.connect(self._validate)
         self.checks = self.picker.checks
+        self.picker_label = plain_label("Or add them to", "FieldLabel",
+                                        make_font(13, QFont.Weight.Medium))
         if self.checks:
             second.addSpacing(z(6))
-            second.addWidget(plain_label("Or add them to", "FieldLabel",
-                                         make_font(13, QFont.Weight.Medium)))
+            second.addWidget(self.picker_label)
             second.addWidget(self.picker)
         self.new_check.setChecked(not any(check.isChecked() for check in self.checks))
         self.new_check.toggled.connect(lambda _on: self._validate())
+        self.update_check.toggled.connect(lambda _on: self._validate())
 
         self.body.addWidget(self.step1)
         self.body.addWidget(self.step2)
         self.step2.hide()
-        self.link_input.textChanged.connect(self._link_changed)
+        self.link_input.textChanged.connect(lambda: self._link_changed(self.link_input.toPlainText()))
         self.name_input.textEdited.connect(self._name_edited)
         ctx.thumbs.ready.connect(self._thumb_ready)
         self._validate()
@@ -4611,30 +5006,37 @@ class PlaylistSheet(Sheet):
             self.job.cancel()
             self.job = None
 
+    # What was pasted
     def _link_changed(self, text: str) -> None:
-        parsed = parse_playlist(text)
-        problem = ""
-        if parsed is None:
-            if not text.strip():
-                problem = PLAYLIST_HINT
-            elif parse_video_id(text):
-                problem = ("That's a link to a single video. Use Add Song for that, or copy the "
-                           "playlist's own link.")
+        stripped = text.strip()
+        if looks_like_share_code(stripped):
+            batch = read_share_code(stripped)
+            if batch is None:
+                self._problem(BROKEN_CODE_HINT, text)
+            elif not batch.entries:
+                self._problem("That share code has no songs in it.", text)
             else:
-                problem = "That isn't a playlist link. Copy it from the playlist's Share button."
-        elif parsed[0] in PRIVATE_LISTS:
-            problem = (f"“{PRIVATE_LISTS[parsed[0]]}” belongs to your account, so it can't be "
-                       "imported without signing in.")
-        if problem:
+                self._use_batch(batch, ("code", "".join(stripped.split())))
+            return
+        ids = parse_link_list(stripped)
+        if len(ids) >= 2:
+            entries = [{"video_id": video_id, "title": "", "channel": "", "duration": None,
+                        "custom": ""} for video_id in ids]
+            self._use_batch(ImportBatch(title="Imported songs", channel="pasted links",
+                                        entries=entries, kind="links"), ("links", tuple(ids)))
+            return
+        parsed = parse_playlist(stripped)
+        if parsed is None:
+            self._problem(SINGLE_VIDEO_HINT if ids else
+                          NOT_IMPORTABLE_HINT if stripped else IMPORT_HINT, text)
+            return
+        if parsed[0] in PRIVATE_LISTS:
+            self._problem(f"“{PRIVATE_LISTS[parsed[0]]}” belongs to your account, so it can't be "
+                          "imported without signing in.", text)
+            return
+        if parsed != self._key:
             self.stop()
-            self._key, self.result = None, None
-            self.preview.hide()
-            self.link_hint.show()
-            self.link_hint.setText(problem)
-            set_flag(self.link_hint, "error", bool(text.strip()))
-        elif parsed != self._key:
-            self._key, self.result = parsed, None
-            self.stop()
+            self._key, self.result, self.match = parsed, None, None
             self.link_hint.hide()
             self.preview.show()
             self.preview.thumb.set_pixmap(None)
@@ -4645,6 +5047,32 @@ class PlaylistSheet(Sheet):
             self.job = PlaylistJob(*parsed, parent=self)
             self.job.done.connect(self._job_done)
             self.job.start()
+        self._validate()
+
+    def _problem(self, message: str, text: str) -> None:
+        self.stop()
+        self._key, self.result, self.match = None, None, None
+        self.preview.hide()
+        self.link_hint.show()
+        self.link_hint.setText(message)
+        set_flag(self.link_hint, "error", bool(text.strip()))
+        self._validate()
+
+    def _use_batch(self, batch: ImportBatch, key) -> None:
+        if key == self._key:
+            return
+        self.stop()
+        self._key, self.result = key, batch
+        library = self.ctx.library
+        self.match = library.category_by_share(batch.share_id) if batch.share_id else None
+        seconds = sum(entry["duration"] or 0 for entry in batch.entries)
+        meta = song_count(len(batch.entries))
+        meta += f", {format_total(seconds)}" if seconds >= 60 else ""
+        meta += f", from {batch.channel}"
+        if self.match is not None:
+            new, removed = share_diff(library, self.match, batch.entries)
+            meta = f"Your “{self.match.title}”, shared back: {diff_text(new, removed)}"
+        self._show_preview(batch.title, meta, batch.entries[0]["video_id"])
         self._validate()
 
     def _job_done(self, job: PlaylistJob) -> None:
@@ -4664,14 +5092,20 @@ class PlaylistSheet(Sheet):
             meta += f", by {job.channel}" if job.channel else ""
             if job.unavailable:
                 meta += f". {job.unavailable} unavailable will be left out"
-            self.preview.title.set_full_text(job.title)
-            set_flag(self.preview.title, "pending", False)
-            self.preview.channel.set_full_text(meta)
-            self._thumb_id = job.entries[0]["video_id"]
-            self.preview.thumb.set_pixmap(self.ctx.thumbs.get(self._thumb_id))
-            if not self._named:
-                self.name_input.setText(job.title[:80])
+            self._show_preview(job.title, meta, job.entries[0]["video_id"])
         self._validate()
+
+    def _show_preview(self, title: str, meta: str, thumb_id: str) -> None:
+        self.link_hint.hide()
+        self.preview.show()
+        self.preview.title.set_full_text(title)
+        set_flag(self.preview.title, "pending", False)
+        self.preview.channel.set_full_text(meta)
+        self.preview.duration.setText("")
+        self._thumb_id = thumb_id
+        self.preview.thumb.set_pixmap(self.ctx.thumbs.get(thumb_id))
+        if not self._named:
+            self.name_input.setText(title[:80])
 
     def _thumb_ready(self, video_id: str) -> None:
         if video_id and video_id == self._thumb_id:
@@ -4681,16 +5115,31 @@ class PlaylistSheet(Sheet):
         self._named = True
         self._validate()
 
+    # Where the songs go
+    @property
+    def updating(self) -> bool:
+        return self.match is not None and self.update_check.isChecked()
+
     def _validate(self) -> None:
-        self.name_input.setEnabled(self.new_check.isChecked())
+        updating = self.updating
+        for widget in (self.new_check, self.name_input, self.picker, self.picker_label):
+            widget.setEnabled(not updating)
+        if not updating:
+            self.name_input.setEnabled(self.new_check.isChecked())
         if self._step == 1:
             self.primary.setEnabled(self.result is not None)
+            return
+        if updating:
+            self.primary.setEnabled(True)
+            self.primary.setText(f"Update “{self.match.title}”")
             return
         wants_new = self.new_check.isChecked()
         named = bool(self.name_input.text().strip())
         existing = any(check.isChecked() for check in self.checks)
         # somewhere to put the songs, and a name if that includes a new category
         self.primary.setEnabled((wants_new or existing) and (named or not wants_new))
+        if self.result is not None:
+            self.primary.setText(f"Import {song_count(len(self.result.entries))}")
 
     def _show_step(self, step: int) -> None:
         self._step = step
@@ -4699,8 +5148,15 @@ class PlaylistSheet(Sheet):
         self.title_label.setText("Import playlist" if step == 1 else "Choose categories")
         self.step_label.setText(f"{step} of 2")
         self.secondary.setText("Cancel" if step == 1 else "Back")
-        if step == 2 and self.result is not None:
-            self.primary.setText(f"Import {song_count(len(self.result.entries))}")
+        if step == 2:
+            match = self.match
+            self.update_check.setVisible(match is not None)
+            if match is not None:
+                new, removed = share_diff(self.ctx.library, match, self.result.entries)
+                self.update_check.set_text(f"Update “{match.title}” to match",
+                                           f"{diff_text(new, removed).capitalize()}; "
+                                           "uses their order and renames")
+                self.update_check.setChecked(True)
         else:
             self.primary.setText("Next")
         (self.link_input if step == 1 else self).setFocus()
@@ -4712,15 +5168,237 @@ class PlaylistSheet(Sheet):
         if self._step == 1:
             self._show_step(2)
             return
+        if self.updating:
+            self.submitted.emit(self.result, "", [], self.match.id)
+            return
         name = self.name_input.text().strip() if self.new_check.isChecked() else ""
-        chosen = [check.category_id for check in self.checks if check.isChecked()]
-        self.submitted.emit(self.result, name, chosen)
+        self.submitted.emit(self.result, name, self.picker.selected(), "")
 
     def on_secondary(self) -> None:
         if self._step == 2:
             self._show_step(1)
         else:
             self.cancelled.emit()
+
+
+class ShareSheet(Sheet):
+    """Share a category: a code for other Tapedeck users, or plain YouTube links."""
+
+    copied = Signal(str)  # the confirmation to show
+
+    def __init__(self, ctx: Ctx, category: Category) -> None:
+        super().__init__(f"Share “{category.title}”", primary="Copy share code",
+                         secondary="Copy links")
+        library = ctx.library
+        library.ensure_share_id(category.id)
+        self.code = make_share_code(library, category)
+        self.links = song_links(library, category)
+        box = QWidget()
+        column = QVBoxLayout(box)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(z(7))
+        column.addWidget(plain_label("Share code", "FieldLabel", make_font(13, QFont.Weight.Medium)))
+        self.code_box = PasteBox(read_only=True)
+        self.code_box.setPlainText(self.code)
+        column.addWidget(self.code_box)
+        about = plain_label("Your friend pastes it into + → Import Playlist. It keeps the order, "
+                            "the subtitle and any titles you renamed. When you send each other "
+                            "newer codes for this playlist, Tapedeck offers to update the copy "
+                            "instead of making another.", "FieldHint", make_font(12))
+        about.setWordWrap(True)
+        column.addWidget(about)
+        self.body.addWidget(box)
+        links = plain_label(f"Copy links puts its {song_count(len(self.links.splitlines()))} on "
+                            "the clipboard as YouTube links, one per line, for anywhere else.",
+                            "FieldHint", make_font(12))
+        links.setWordWrap(True)
+        self.body.addWidget(links)
+
+    def on_primary(self) -> None:
+        QApplication.clipboard().setText(self.code)
+        self.copied.emit("Share code copied")
+
+    def on_secondary(self) -> None:
+        QApplication.clipboard().setText(self.links)
+        self.copied.emit("Links copied")
+
+
+ACCENT_PRESETS = (("#4592a2", "Teal (default)"), ("#4f7cff", "Blue"), ("#8b6cf6", "Violet"),
+                  ("#e2609b", "Pink"), ("#e5534b", "Red"), ("#ea8a3a", "Orange"),
+                  ("#d4b43a", "Gold"), ("#4fb36a", "Green"))
+ACCENT_HINT = "Type a hex code like #4592a2, or pick a color."
+
+
+def saved_counts(ctx: Ctx) -> tuple[int, int]:
+    videos = {song.video_id for song in ctx.library.songs.values()}
+    return sum(1 for video_id in videos if ctx.cache.path_for(video_id) is not None), len(videos)
+
+
+class Swatch(QAbstractButton):
+    """A preset accent color to pick."""
+
+    def __init__(self, color: str, name: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.color = color
+        self._selected = False
+        self.setFixedSize(z(26), z(26))
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.setToolTip(f"{name}  {color}")
+
+    def set_selected(self, selected: bool) -> None:
+        if selected != self._selected:
+            self._selected = selected
+            self.update()
+
+    def enterEvent(self, event) -> None:
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, _event) -> None:
+        painter, w, h = zoomed_painter(self)
+        center = QPointF(w / 2, h / 2)
+        if self._selected or self.underMouse() or self.hasFocus():
+            painter.setPen(QPen(QColor(WHITE if self._selected or self.hasFocus() else HAIRLINE_HI),
+                                1.6))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(center, 11.6, 11.6)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(self.color))
+        painter.drawEllipse(center, 8.6, 8.6)
+
+
+class AccentPreview(QWidget):
+    """How an accent color looks on Tapedeck's controls, before saving it."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFixedHeight(z(48))
+        self.color: str | None = ACCENT
+
+    def set_color(self, color: str | None) -> None:
+        self.color = color
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        painter, w, h = zoomed_painter(self)
+        if self.color is None:  # not a color (yet): show the shapes as outlines
+            painter.setPen(QPen(QColor(HAIRLINE_HI), 1.2, Qt.PenStyle.DashLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(QRectF(0.5, 6.5, w - 1, 35), 11, 11)
+            return
+        colors = accent_palette(self.color)
+        accent, on_accent = QColor(colors["ACCENT"]), QColor(colors["ON_ACCENT"])
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(accent)  # the + button
+        painter.drawRoundedRect(QRectF(0, 6, 36, 36), 11, 11)
+        painter.setPen(QPen(on_accent, 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawLine(QPointF(11, 24), QPointF(25, 24))
+        painter.drawLine(QPointF(18, 17), QPointF(18, 31))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(accent)  # play
+        painter.drawEllipse(QPointF(64, 24), 16, 16)
+        draw_glyph(painter, "play", QPointF(64, 24), on_accent, scale=0.92)
+        painter.setBrush(accent)  # a ticked box
+        box = QRectF(94, 15, 18, 18)
+        painter.drawRoundedRect(box, 5, 5)
+        painter.setPen(QPen(on_accent, 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                            Qt.PenJoinStyle.RoundJoin))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        tick = QPainterPath(QPointF(box.left() + 4.6, box.center().y() + 0.3))
+        tick.lineTo(box.left() + 7.8, box.bottom() - 4.8)
+        tick.lineTo(box.right() - 4.2, box.top() + 5.0)
+        painter.drawPath(tick)
+        left, right = 128.0, max(140.0, w - 6)  # the locator, part played
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(HAIRLINE_HI))
+        painter.drawRoundedRect(QRectF(left, 22, right - left, 4), 2, 2)
+        painter.setBrush(accent)
+        played = left + (right - left) * 0.6
+        painter.drawRoundedRect(QRectF(left, 22, played - left, 4), 2, 2)
+        painter.setBrush(QColor(WHITE))
+        painter.drawEllipse(QPointF(played, 24), 6.5, 6.5)
+
+
+class SettingsSheet(Sheet):
+    """Accent color and instant-play saving."""
+
+    submitted = Signal(str, bool)  # accent color, save songs for instant play
+
+    def __init__(self, ctx: Ctx) -> None:
+        super().__init__("Settings", primary="Save")
+        self.ctx = ctx
+        box = QWidget()
+        column = QVBoxLayout(box)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(z(9))
+        column.addWidget(plain_label("Accent color", "FieldLabel", make_font(13, QFont.Weight.Medium)))
+        row = QHBoxLayout()
+        row.setSpacing(z(6))
+        self.hex_input = QLineEdit()
+        self.hex_input.setFont(make_font(14, tabular=True))
+        self.hex_input.setPlaceholderText(DEFAULT_ACCENT)
+        self.hex_input.setMaxLength(7)
+        self.hex_input.setFixedWidth(z(112))
+        self.hex_input.setText(ACCENT)
+        row.addWidget(self.hex_input)
+        row.addSpacing(z(6))
+        self.swatches = [Swatch(color, name) for color, name in ACCENT_PRESETS]
+        for swatch in self.swatches:
+            swatch.clicked.connect(lambda _checked=False, c=swatch.color: self.hex_input.setText(c))
+            row.addWidget(swatch)
+        row.addStretch(1)
+        column.addLayout(row)
+        self.preview = AccentPreview()
+        column.addWidget(self.preview)
+        self.accent_hint = plain_label(ACCENT_HINT, "FieldHint", make_font(12))
+        self.accent_hint.setWordWrap(True)
+        column.addWidget(self.accent_hint)
+        self.body.addWidget(box)
+
+        saved, total = saved_counts(ctx)
+        self.save_check = CheckRow("", "Save songs for instant play",
+                                   f"{saved} of {song_count(total)} saved, "
+                                   f"{size_text(ctx.cache.size_bytes())}")
+        self.save_check.setChecked(ctx.cache.enabled)
+        self.body.addWidget(self.save_check)
+        zoom = plain_label(f"Zoom is {round(ZOOM * 100)}%. Change it with Ctrl+scroll or "
+                           "Ctrl+plus and minus; Ctrl+0 resets it.", "FieldHint", make_font(12))
+        zoom.setWordWrap(True)
+        self.body.addWidget(zoom)
+        self.hex_input.textChanged.connect(self._hex_changed)
+        self._hex_changed(self.hex_input.text())
+
+    def focus_target(self) -> QWidget:
+        return self.hex_input
+
+    @property
+    def color(self) -> str | None:
+        return parse_hex(self.hex_input.text())
+
+    def _hex_changed(self, _text: str) -> None:
+        color = self.color
+        self.preview.set_color(color)
+        for swatch in self.swatches:
+            swatch.set_selected(swatch.color == color)
+        if color is None:
+            hint, warn = "That isn't a hex color yet: six digits, like #4592a2.", True
+        elif contrast(color, BLACK) < 3:
+            hint, warn = "That's hard to see on Tapedeck's black background. A lighter color works better.", True
+        else:
+            hint, warn = ACCENT_HINT, False
+        self.accent_hint.setText(hint)
+        set_flag(self.accent_hint, "error", warn)
+        self.primary.setEnabled(color is not None)
+
+    def on_primary(self) -> None:
+        color = self.color
+        if color is not None:
+            self.submitted.emit(color, self.save_check.isChecked())
 
 
 SONG_CATEGORIES_HINT = ("The song is in the ticked categories. Tick others to add it to their "
@@ -4904,8 +5582,11 @@ class CategoryPage(QWidget):
         heading.addSpacing(z(4))
         heading.addWidget(self.meta)
         header.addLayout(heading, 1)
+        self.share_button = GlyphButton("share", size=44, radius=13, variant="outline")
+        self.share_button.setToolTip("Share or export")
         self.shuffle_button = GlyphButton("shuffle", size=44, radius=13, variant="toggle")
         self.play_button = GlyphButton("play", size=44, radius=13, variant="outline")
+        header.addWidget(self.share_button, 0, Qt.AlignmentFlag.AlignBottom)
         header.addWidget(self.shuffle_button, 0, Qt.AlignmentFlag.AlignBottom)
         header.addWidget(self.play_button, 0, Qt.AlignmentFlag.AlignBottom)
         column.addLayout(header)
@@ -4925,6 +5606,8 @@ class CategoryPage(QWidget):
         self.play_button.clicked.connect(lambda: toggle_category_play(ctx.player, category_id))
         self.shuffle_button.clicked.connect(
             lambda: toggle_category_shuffle(ctx.player, category_id))
+        self.share_button.clicked.connect(
+            lambda: ctx.window.open_share(category_id) if ctx.window is not None else None)
         self.refresh_heading()
         self.sync()
 
@@ -4943,6 +5626,7 @@ class CategoryPage(QWidget):
         self.list.sync(list(category.song_ids))
         self.empty.setVisible(not category.song_ids)
         self.list.setVisible(bool(category.song_ids))
+        self.share_button.setEnabled(bool(category.song_ids))
         self._update_meta()
         sync_category_controls(self.ctx, self.category_id, self.play_button, self.shuffle_button)
 
@@ -5165,9 +5849,17 @@ class SideBar(QFrame):
         column = QVBoxLayout(self)
         column.setContentsMargins(0, z(22), 0, z(8))
         column.setSpacing(z(2))
-        wordmark = plain_label("tapedeck", "Wordmark", make_font(22, QFont.Weight.Bold, tracking=-0.6))
-        wordmark.setContentsMargins(z(24), 0, 0, 0)
-        column.addWidget(wordmark)
+        top = QHBoxLayout()
+        top.setContentsMargins(z(24), 0, z(14), 0)
+        top.addWidget(plain_label("tapedeck", "Wordmark",
+                                  make_font(22, QFont.Weight.Bold, tracking=-0.6)))
+        top.addStretch(1)
+        self.settings_button = GlyphButton("settings", size=30, radius=9, variant="bare")
+        self.settings_button.setToolTip("Settings  (Ctrl+,)")
+        self.settings_button.clicked.connect(
+            lambda: ctx.window.open_settings() if ctx.window is not None else None)
+        top.addWidget(self.settings_button)
+        column.addLayout(top)
         column.addSpacing(z(22))
         self.all_tab = SideTab("", "All categories")
         self.all_tab.clicked.connect(lambda _checked=False: self._clicked(""))
@@ -5246,14 +5938,20 @@ class SideBar(QFrame):
 
     def _tab_menu(self, tab: SideTab, pos: QPoint) -> None:
         window = self.ctx.window
+        category = self.ctx.library.category(tab.key)
         menu = QMenu(self)
         rename = menu.addAction("Rename category")
+        share = menu.addAction("Share or export…")
+        share.setEnabled(bool(category and category.song_ids))
+        menu.addSeparator()
         delete = menu.addAction("Delete category…")
         chosen = menu.exec(tab.mapToGlobal(pos))
         if window is None:
             return
         if chosen == rename:
             window.rename_category(tab.key)
+        elif chosen == share:
+            window.open_share(tab.key)
         elif chosen == delete:
             window.confirm_delete_category(tab.key)
 
@@ -5310,13 +6008,17 @@ class TransportBar(QFrame):
         middle.setSpacing(z(2))
         controls = QHBoxLayout()
         controls.setSpacing(z(16))
+        self.shuffle_button = GlyphButton("shuffle", size=34, radius=17, variant="bare")
         self.prev_button = GlyphButton("prev", size=34, radius=17, variant="bare")
         self.play_button = GlyphButton("pause", size=40, radius=20, variant="primary")
         self.next_button = GlyphButton("next", size=34, radius=17, variant="bare")
+        self.repeat_button = GlyphButton("repeat", size=34, radius=17, variant="bare")
         controls.addStretch(1)
-        for button, tooltip, action in ((self.prev_button, "Previous", player.previous),
+        for button, tooltip, action in ((self.shuffle_button, "Shuffle", player.toggle_shuffle),
+                                        (self.prev_button, "Previous", player.previous),
                                         (self.play_button, "Pause", player.toggle_pause),
-                                        (self.next_button, "Next", player.next)):
+                                        (self.next_button, "Next", player.next),
+                                        (self.repeat_button, "Repeat this song", player.toggle_repeat)):
             button.setToolTip(tooltip)
             button.clicked.connect(lambda _checked=False, act=action: act())
             controls.addWidget(button)
@@ -5389,6 +6091,10 @@ class TransportBar(QFrame):
         self.prev_button.setEnabled(active and player.has_previous())
         self.next_button.setEnabled(active and player.has_next())
         self.play_button.setEnabled(active)
+        shuffling = player.queue is not None and player.queue.mode == "shuffle"
+        self.shuffle_button.setEnabled(active and player.queue.mode != "single")
+        self.shuffle_button.set_active(shuffling)
+        self.shuffle_button.setToolTip("Turn off shuffle" if shuffling else "Shuffle this category")
         self._sync_play_button()
         if not active:
             self.show_position(None, None)
@@ -5407,10 +6113,12 @@ class TransportBar(QFrame):
         category = self.ctx.library.category(queue.category_id)
         name = category.title if category else ""
         if queue.mode == "single":
-            return f"From {name}" if name else "Playing"
+            text = f"From {name}" if name else "Playing"
+            return text + (", on repeat" if player.repeat_one else "")
         number, total = player.progress()
         text = f"{number} of {total}" + (f" in {name}" if name else "")
-        return text + (", shuffled" if queue.mode == "shuffle" else "")
+        text += ", shuffled" if queue.mode == "shuffle" else ""
+        return text + (", on repeat" if player.repeat_one else "")
 
     def state_changed(self) -> None:
         player = self.ctx.player
@@ -5421,6 +6129,9 @@ class TransportBar(QFrame):
             kind = "volume-low" if player.volume < 50 else "volume-high"
         self.mute_button.set_kind(kind)
         self.mute_button.setToolTip("Unmute" if player.muted else "Mute")
+        self.repeat_button.set_active(player.repeat_one)
+        self.repeat_button.setToolTip("Stop repeating this song" if player.repeat_one
+                                      else "Repeat this song")
         self._sync_play_button()
         self.status.set_full_text(self.status_text())
 
@@ -5526,7 +6237,8 @@ class MainWindow(QMainWindow):
                              ("Right", lambda: self._seek_by(5.0)),
                              ("F11", self._toggle_fullscreen),
                              ("Ctrl++", lambda: self.zoom_by(1)), ("Ctrl+=", lambda: self.zoom_by(1)),
-                             ("Ctrl+-", lambda: self.zoom_by(-1)), ("Ctrl+0", self.reset_zoom)):
+                             ("Ctrl+-", lambda: self.zoom_by(-1)), ("Ctrl+0", self.reset_zoom),
+                             ("Ctrl+,", self.open_settings)):
             shortcut = QShortcut(QKeySequence(keys), self)
             shortcut.activated.connect(action)
         app = QApplication.instance()
@@ -5615,19 +6327,23 @@ class MainWindow(QMainWindow):
         if target is None:
             return
         if abs(target - ZOOM) > 1e-6:
-            page, fraction = self.current_page, self._scroll_fraction()
-            old = self.takeCentralWidget()
-            if old is not None:  # delete the old widgets now, so restyling skips them
-                old.deleteLater()
-                QCoreApplication.sendPostedEvents(old, QEvent.Type.DeferredDelete)
             set_zoom(target)
             self.ctx.settings.set("zoom", ZOOM)
-            apply_app_style()
-            self._build()
-            self.show_page(page)
-            later(0, lambda: self._restore_scroll(fraction))
+            self._rebuild_ui()
             log.info("Zoom %d%%", round(ZOOM * 100))
         self.toast.show_message(f"Zoom {round(ZOOM * 100)}%")
+
+    def _rebuild_ui(self) -> None:
+        """Build every widget again (new zoom or accent), keeping the page and scroll position."""
+        page, fraction = self.current_page, self._scroll_fraction()
+        old = self.takeCentralWidget()
+        if old is not None:  # delete the old widgets now, so restyling skips them
+            old.deleteLater()
+            QCoreApplication.sendPostedEvents(old, QEvent.Type.DeferredDelete)
+        apply_app_style()
+        self._build()
+        self.show_page(page)
+        later(0, lambda: self._restore_scroll(fraction))
 
     def _current_scroller(self) -> QScrollArea:
         page = self.pages.get(self.current_page)
@@ -5891,6 +6607,42 @@ class MainWindow(QMainWindow):
 
         sheet.submitted.connect(create)
 
+    def open_settings(self) -> None:
+        sheet = SettingsSheet(self.ctx)
+        overlay = self._open_sheet(sheet)
+
+        def save(color: str, saving: bool) -> None:
+            overlay.dismiss()
+            cache = self.ctx.cache
+            if saving != cache.enabled:
+                cache.set_enabled(saving)
+                if saving:
+                    cache.want_library(self.ctx.library)
+            if color != ACCENT:  # after this click finishes: the rebuild replaces the button
+                later(0, lambda: self.apply_accent(color))
+
+        sheet.submitted.connect(save)
+
+    def apply_accent(self, color: str) -> None:
+        set_accent(color)
+        self.ctx.settings.set("accent", ACCENT)
+        self._rebuild_ui()
+        log.info("Accent color %s", ACCENT)
+        self.toast.show_message("Accent color updated")
+
+    def open_share(self, category_id: str) -> None:
+        category = self.ctx.library.category(category_id)
+        if category is None or not category.song_ids:
+            return
+        sheet = ShareSheet(self.ctx, category)
+        overlay = self._open_sheet(sheet)
+
+        def copied(message: str) -> None:
+            overlay.dismiss()
+            self.toast.show_message(message)
+
+        sheet.copied.connect(copied)
+
     def open_song_categories(self, song_id: str) -> None:
         """The checkbox prompt for one song's categories (from any right-click menu)."""
         player = self.ctx.player
@@ -5914,25 +6666,47 @@ class MainWindow(QMainWindow):
         overlay = self._open_sheet(sheet)
         overlay.dismissed.connect(sheet.stop)
 
-        def import_songs(job: PlaylistJob, new_title: str, category_ids: list) -> None:
+        def import_songs(source, new_title: str, category_ids: list, update_id: str) -> None:
             library = self.ctx.library
+            if update_id:  # a newer share code of a playlist we already have
+                category = library.category(update_id)
+                added, removed = library.replace_category_songs(
+                    update_id, source.entries, title=source.title, subtitle=source.subtitle)
+                overlay.dismiss()
+                self.toast.show_message(update_summary(added, removed,
+                                                       category.title if category else source.title))
+                self.show_page(update_id)
+                self._fill_in(source.entries)
+                return
             targets = list(category_ids)
             created = None
             if new_title:
-                created = library.add_category(new_title)
+                created = library.add_category(new_title, source.subtitle)
+                if source.share_id and library.category_by_share(source.share_id) is None:
+                    created.share_id = source.share_id  # later codes of it update this copy
+                    library.save()
                 targets.insert(0, created.id)
-            added = library.import_songs(job.entries, targets)
+            added = library.import_songs(source.entries, targets)
             overlay.dismiss()
-            self.toast.show_message(import_summary(library, added, len(job.entries),
-                                                   job.unavailable, created))
+            self.toast.show_message(import_summary(library, added, len(source.entries),
+                                                   source.unavailable, created))
             if created is not None:
                 self.show_page(created.id)
-            for entry in job.entries:  # save them for instant play, playlist order first
-                self.ctx.cache.want(entry["video_id"], Priority.BACKGROUND)
-                if not entry["title"] or entry["duration"] is None:
-                    self.ctx.fetcher.request(entry["video_id"])
+            self._fill_in(source.entries)
 
         sheet.submitted.connect(import_songs)
+
+    def _fill_in(self, entries: list[dict]) -> None:
+        """Save imported songs for instant play, and look up the details a source lacked."""
+        known = {song.video_id: song for song in self.ctx.library.songs.values()}
+        for entry in entries:  # playlist order first
+            video_id = entry["video_id"]
+            self.ctx.cache.want(video_id, Priority.BACKGROUND)
+            song = known.get(video_id)
+            if song is not None and song.yt_title and song.duration is not None:
+                continue
+            if not entry.get("title") or entry.get("duration") is None:
+                self.ctx.fetcher.request(video_id, need_duration=entry.get("duration") is None)
 
     def confirm_delete_category(self, category_id: str) -> None:
         category = self.ctx.library.category(category_id)
@@ -5975,7 +6749,9 @@ class MainWindow(QMainWindow):
 
 
 # ── Theme ────────────────────────────────────────────────────────────────────
-STYLESHEET = f"""
+def stylesheet_source() -> str:
+    """Written at 100% zoom; build_stylesheet() scales it."""
+    return f"""
 #Root {{ background: {BLACK}; }}
 QToolTip {{ background: {BLACK}; color: {WHITE}; border: 1px solid {HAIRLINE_HI};
            border-radius: 6px; padding: 6px 8px; }}
@@ -6016,8 +6792,12 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{ background: 
 
 QLineEdit {{ background: {BLACK}; color: {WHITE}; border: 1px solid {HAIRLINE_HI};
             border-radius: 9px; padding: 9px 12px;
-            selection-background-color: {ACCENT}; selection-color: {BLACK}; }}
+            selection-background-color: {ACCENT}; selection-color: {ON_ACCENT}; }}
 QLineEdit:focus {{ border: 1px solid {ACCENT}; }}
+QPlainTextEdit#PasteBox {{ background: {BLACK}; color: {WHITE}; border: 1px solid {HAIRLINE_HI};
+            border-radius: 9px; padding: 5px 7px;
+            selection-background-color: {ACCENT}; selection-color: {ON_ACCENT}; }}
+QPlainTextEdit#PasteBox:focus {{ border: 1px solid {ACCENT}; }}
 #InlineEditor {{ padding: 3px 7px; border-radius: 6px; border: 1px solid {ACCENT}; }}
 
 #Sheet {{ background: {BLACK}; border: 1px solid {HAIRLINE_HI}; border-radius: 18px; }}
@@ -6034,12 +6814,13 @@ QLineEdit:focus {{ border: 1px solid {ACCENT}; }}
 #PreviewTitle[pending="true"] {{ color: {SMOKE}; }}
 #PreviewMeta {{ color: {SMOKE}; }}
 
-QPushButton#Primary {{ background: {ACCENT}; color: {BLACK}; border: 2px solid {ACCENT};
+QPushButton#Primary {{ background: {ACCENT}; color: {ON_ACCENT}; border: 2px solid {ACCENT};
                       border-radius: 9px; padding: 8px 20px; min-width: 56px; }}
 QPushButton#Primary:hover {{ background: {ACCENT_HI}; border-color: {ACCENT_HI}; }}
 QPushButton#Primary:pressed {{ background: {ACCENT_LO}; border-color: {ACCENT_LO}; }}
 QPushButton#Primary:focus {{ border-color: {WHITE}; }}
-QPushButton#Primary:disabled {{ background: #17292d; border-color: #17292d; color: #4f6c72; }}
+QPushButton#Primary:disabled {{ background: {ACCENT_DIM_BG}; border-color: {ACCENT_DIM_BG};
+                                color: {ACCENT_DIM_FG}; }}
 QPushButton#Ghost {{ background: transparent; color: {SMOKE}; border: 1px solid {HAIRLINE_HI};
                     border-radius: 9px; padding: 9px 18px; min-width: 56px; }}
 QPushButton#Ghost:hover {{ color: {WHITE}; border-color: #5a5a5a; }}
@@ -6068,7 +6849,7 @@ QPushButton#MenuItem:focus {{ border-color: {WHITE}; }}
 
 QMenu {{ background: {BLACK}; color: {WHITE}; border: 1px solid {HAIRLINE_HI}; padding: 6px; }}
 QMenu::item {{ padding: 8px 16px; border-radius: 6px; }}
-QMenu::item:selected {{ background: {ACCENT}; color: {BLACK}; }}
+QMenu::item:selected {{ background: {ACCENT}; color: {ON_ACCENT}; }}
 """
 
 
@@ -6076,15 +6857,17 @@ def build_stylesheet() -> str:
     def scale(match: re.Match) -> str:
         value = float(match.group(1))
         return f"{max(1, round(value * ZOOM)) if value else 0}px"
-    return re.sub(r"(\d+(?:\.\d+)?)px", scale, STYLESHEET)
+    return re.sub(r"(\d+(?:\.\d+)?)px", scale, stylesheet_source())
 
 
 def apply_app_style(app: QApplication | None = None) -> None:
     app = app or QApplication.instance()
     if app is None:
         return
+    app.setPalette(build_palette())
     app.setFont(make_font(13))
     app.setStyleSheet(build_stylesheet())
+    app.setWindowIcon(app_icon())  # the icon wears the accent too
 
 
 def build_palette() -> QPalette:
@@ -6098,7 +6881,7 @@ def build_palette() -> QPalette:
         QPalette.ColorRole.Button: BLACK,
         QPalette.ColorRole.ButtonText: WHITE,
         QPalette.ColorRole.Highlight: ACCENT,
-        QPalette.ColorRole.HighlightedText: BLACK,
+        QPalette.ColorRole.HighlightedText: ON_ACCENT,
         QPalette.ColorRole.ToolTipBase: BLACK,
         QPalette.ColorRole.ToolTipText: WHITE,
         QPalette.ColorRole.PlaceholderText: ASH,
@@ -6214,11 +6997,10 @@ def main() -> int:
     QApplication.setDesktopFileName(APP_ID)
     app = QApplication([arg for arg in sys.argv if arg != "--debug"])
     app.setStyle("Fusion")
-    app.setPalette(build_palette())
-    app.setWindowIcon(app_icon())
 
     ctx = Ctx()
     set_zoom(ctx.settings.get("zoom", 1.0))
+    set_accent(ctx.settings.get("accent", DEFAULT_ACCENT))
     apply_app_style(app)
     if ctx.library.songs:  # never treat an unreadable library as "delete every saved song"
         ctx.cache.keep_only({song.video_id for song in ctx.library.songs.values()})
