@@ -1,8 +1,12 @@
 package app.tapedeck.player
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -28,7 +32,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ContentPaste
+import androidx.compose.material.icons.filled.DownloadDone
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
@@ -52,6 +58,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -80,6 +88,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
@@ -182,6 +191,39 @@ fun TapedeckApp(store: LibraryStore, controller: MediaController?) {
     }
     var screen by remember { mutableStateOf<Screen>(Screen.Library) }
     val player = rememberPlayer(controller)
+    val context = LocalContext.current
+    val status by Offline.status.collectAsState()
+    val saved by Offline.saved.collectAsState()
+    var mobileData by remember { mutableStateOf(Offline.mobileDataAllowed(context)) }
+
+    // Every song in the library gets saved; removed ones are forgotten. Titles filling in
+    // don't change the set, so they don't trigger this.
+    val songIds = remember(categories) {
+        categories.flatMapTo(HashSet()) { category -> category.songs.map { it.videoId } }
+    }
+    LaunchedEffect(songIds) {
+        delay(400)  // a burst of changes syncs once
+        Offline.sync(context, store.categories.value)
+    }
+    LaunchedEffect(status.active) {  // live progress while songs are saving
+        while (status.active) {
+            delay(1000)
+            Offline.refresh()
+        }
+    }
+    // Android 13 and later ask before showing the saving notification; ask once.
+    val askToNotify = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    val stillSaving = status.enabled && status.saved + status.failed < status.total
+    LaunchedEffect(stillSaving) {
+        val preferences = Offline.preferences(context)
+        if (stillSaving && Build.VERSION.SDK_INT >= 33 && !preferences.getBoolean("asked", false) &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            preferences.edit().putBoolean("asked", true).apply()
+            askToNotify.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
 
     MaterialTheme(colorScheme = scheme) {
         Surface(color = Background, modifier = Modifier.fillMaxSize()) {
@@ -190,9 +232,18 @@ fun TapedeckApp(store: LibraryStore, controller: MediaController?) {
                     when (val current = screen) {
                         Screen.Library -> LibraryScreen(
                             categories = categories,
+                            status = status,
+                            mobileData = mobileData,
                             onOpen = { screen = Screen.Open(it) },
                             onImport = { screen = Screen.Import },
                             onPlay = { category, shuffle -> playCategory(controller, category, null, shuffle) },
+                            onSaving = { on -> Offline.setSaving(context, on, store.categories.value) },
+                            onMobileData = { allowed ->
+                                mobileData = allowed
+                                Offline.setMobileData(context, allowed)
+                            },
+                            onDeleteSaved = { Offline.deleteSaved(context) },
+                            onTryAgain = { Offline.sync(context, store.categories.value, retryFailed = true) },
                         )
                         is Screen.Open -> {
                             BackHandler { screen = Screen.Library }
@@ -203,6 +254,7 @@ fun TapedeckApp(store: LibraryStore, controller: MediaController?) {
                                 CategoryScreen(
                                     category = category,
                                     playingId = player.videoId,
+                                    saved = saved,
                                     store = store,
                                     onBack = { screen = Screen.Library },
                                     onPlay = { index, shuffle -> playCategory(controller, category, index, shuffle) },
@@ -247,10 +299,18 @@ private fun rememberPlayer(controller: MediaController?): PlayerUi {
 @Composable
 private fun LibraryScreen(
     categories: List<Category>,
+    status: SaveStatus,
+    mobileData: Boolean,
     onOpen: (String) -> Unit,
     onImport: () -> Unit,
     onPlay: (Category, Boolean) -> Unit,
+    onSaving: (Boolean) -> Unit,
+    onMobileData: (Boolean) -> Unit,
+    onDeleteSaved: () -> Unit,
+    onTryAgain: () -> Unit,
 ) {
+    var menu by remember { mutableStateOf(false) }
+    var confirmDelete by remember { mutableStateOf(false) }
     Scaffold(
         containerColor = Background,
         topBar = {
@@ -258,6 +318,36 @@ private fun LibraryScreen(
                 title = { Text("tapedeck", fontWeight = FontWeight.Bold) },
                 actions = {
                     IconButton(onClick = onImport) { Icon(Icons.Filled.Add, contentDescription = "Import") }
+                    Box {
+                        IconButton(onClick = { menu = true }) {
+                            Icon(Icons.Filled.MoreVert, contentDescription = "More")
+                        }
+                        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                            DropdownMenuItem(
+                                text = { Text("Save songs for offline") },
+                                trailingIcon = { if (status.enabled) Icon(Icons.Filled.Check, contentDescription = "On") },
+                                onClick = {
+                                    menu = false
+                                    onSaving(!status.enabled)
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Use mobile data for saving") },
+                                trailingIcon = { if (mobileData) Icon(Icons.Filled.Check, contentDescription = "On") },
+                                onClick = {
+                                    menu = false
+                                    onMobileData(!mobileData)
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Delete saved songs") },
+                                onClick = {
+                                    menu = false
+                                    confirmDelete = true
+                                },
+                            )
+                        }
+                    }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = Background),
             )
@@ -292,10 +382,90 @@ private fun LibraryScreen(
                         modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp),
                     )
                 }
+                if (status.total > 0) {
+                    item {
+                        SavingPanel(status, onAllowMobileData = { onMobileData(true) },
+                            onTurnOn = { onSaving(true) }, onTryAgain = onTryAgain)
+                    }
+                }
                 items(categories, key = { it.id }) { category ->
                     CategoryCard(category, onOpen = { onOpen(category.id) }, onPlay = { onPlay(category, it) })
                 }
                 item { Spacer(Modifier.height(12.dp)) }
+            }
+        }
+    }
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text("Delete saved songs?") },
+            text = {
+                Text("They'll stream from YouTube again, and saving stays off until you turn it " +
+                    "back on in this menu. Your library stays as it is.")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmDelete = false
+                    onDeleteSaved()
+                }) { Text("Delete", color = Danger) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDelete = false }) { Text("Cancel") }
+            },
+            containerColor = Raised,
+        )
+    }
+}
+
+/** How far along saving is: a progress bar until every song is on the phone. */
+@Composable
+private fun SavingPanel(status: SaveStatus, onAllowMobileData: () -> Unit, onTurnOn: () -> Unit, onTryAgain: () -> Unit) {
+    val accent = MaterialTheme.colorScheme.primary
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 6.dp)
+            .clip(RoundedCornerShape(14.dp))
+            .background(Panel)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+    ) {
+        if (status.saved >= status.total) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Filled.DownloadDone, contentDescription = null, tint = accent, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("All ${songCount(status.total)} are on this phone (${formatBytes(status.bytes)}) and play offline.",
+                    color = Smoke, style = MaterialTheme.typography.bodySmall)
+            }
+        } else {
+            Text(
+                if (status.enabled) "Saving songs for offline: ${status.saved} of ${status.total}"
+                else "${status.saved} of ${status.total} songs saved for offline",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            LinearProgressIndicator(
+                progress = { status.progress },
+                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp).height(4.dp),
+                color = accent,
+                trackColor = Line,
+            )
+            val detail = when {
+                !status.enabled -> "Saving is off."
+                status.waitingForNetwork -> "Waiting for an internet connection."
+                status.waitingForWifi -> "Waiting for Wi-Fi."
+                else -> "Saved songs play offline; the rest stream meanwhile."
+            }
+            Text("$detail ${formatBytes(status.bytes)} used.", color = Smoke, style = MaterialTheme.typography.bodySmall)
+            if (!status.enabled) {
+                TextButton(onClick = onTurnOn) { Text("Turn saving on") }
+            } else if (status.waitingForWifi && !status.waitingForNetwork) {
+                TextButton(onClick = onAllowMobileData) { Text("Use mobile data too") }
+            }
+            if (status.failed > 0) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("${status.failed} couldn't be saved.", color = Danger, style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.weight(1f))
+                    TextButton(onClick = onTryAgain) { Text("Try again") }
+                }
             }
         }
     }
@@ -335,6 +505,7 @@ private fun CategoryCard(category: Category, onOpen: () -> Unit, onPlay: (Boolea
 private fun CategoryScreen(
     category: Category,
     playingId: String?,
+    saved: Set<String>,
     store: LibraryStore,
     onBack: () -> Unit,
     onPlay: (Int?, Boolean) -> Unit,
@@ -398,6 +569,7 @@ private fun CategoryScreen(
                     position = index + 1,
                     song = song,
                     playing = song.videoId == playingId,
+                    saved = song.videoId in saved,
                     onClick = { onPlay(index, false) },
                     onRemove = { store.removeSong(category.id, song.videoId) },
                 )
@@ -426,7 +598,14 @@ private fun CategoryScreen(
 }
 
 @Composable
-private fun SongRow(position: Int, song: Song, playing: Boolean, onClick: () -> Unit, onRemove: () -> Unit) {
+private fun SongRow(
+    position: Int,
+    song: Song,
+    playing: Boolean,
+    saved: Boolean,
+    onClick: () -> Unit,
+    onRemove: () -> Unit,
+) {
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
     var menu by remember { mutableStateOf(false) }
@@ -459,6 +638,11 @@ private fun SongRow(position: Int, song: Song, playing: Boolean, onClick: () -> 
                     maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
         }
+        if (saved) {
+            Icon(Icons.Filled.DownloadDone, contentDescription = "Saved on this phone", tint = Smoke,
+                modifier = Modifier.size(15.dp))
+            Spacer(Modifier.width(6.dp))
+        }
         Text(formatDuration(song.seconds), color = Smoke, style = MaterialTheme.typography.bodySmall)
         Box {
             IconButton(onClick = { menu = true }) {
@@ -485,13 +669,12 @@ private fun SongRow(position: Int, song: Song, playing: Boolean, onClick: () -> 
 @Composable
 private fun MiniPlayer(state: PlayerUi, controller: MediaController?) {
     val accent = MaterialTheme.colorScheme.primary
+    // While dragging, the bar and the time follow the finger; the song jumps there on release.
+    var dragging by remember { mutableStateOf<Float?>(null) }
+    val length = state.duration
+    val played = if (length > 0) (state.position.toFloat() / length).coerceIn(0f, 1f) else 0f
+    val shown = dragging ?: played
     Column(Modifier.fillMaxWidth().background(Panel)) {
-        LinearProgressIndicator(
-            progress = { if (state.duration > 0) (state.position.toFloat() / state.duration).coerceIn(0f, 1f) else 0f },
-            modifier = Modifier.fillMaxWidth().height(2.dp),
-            color = accent,
-            trackColor = Line,
-        )
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier.padding(start = 12.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
@@ -534,6 +717,31 @@ private fun MiniPlayer(state: PlayerUi, controller: MediaController?) {
             }) {
                 Icon(Icons.Filled.RepeatOne, contentDescription = "Repeat this song", tint = if (state.repeatOne) accent else Smoke)
             }
+        }
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(start = 14.dp, end = 14.dp, bottom = 4.dp),
+        ) {
+            Text(formatTime(if (dragging != null) (shown * length).toLong() else state.position),
+                color = Smoke, style = MaterialTheme.typography.labelSmall, modifier = Modifier.width(44.dp))
+            Slider(
+                value = shown,
+                onValueChange = { dragging = it },
+                onValueChangeFinished = {
+                    val target = dragging
+                    if (target != null && length > 0) controller?.seekTo((target * length).toLong())
+                    dragging = null
+                },
+                enabled = controller != null && length > 0,
+                colors = SliderDefaults.colors(
+                    thumbColor = accent,
+                    activeTrackColor = accent,
+                    inactiveTrackColor = Line,
+                ),
+                modifier = Modifier.weight(1f).height(30.dp),
+            )
+            Text(formatTime(length), color = Smoke, style = MaterialTheme.typography.labelSmall,
+                textAlign = TextAlign.End, modifier = Modifier.width(44.dp))
         }
     }
 }

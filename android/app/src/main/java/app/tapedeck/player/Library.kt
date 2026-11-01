@@ -33,12 +33,22 @@ data class Category(
     val songs: List<Song>,
 )
 
-fun formatDuration(seconds: Int): String {
-    if (seconds <= 0) return "–:––"
+/** "3:45", or "1:02:05" for long ones. */
+fun formatTime(milliseconds: Long): String {
+    val seconds = (milliseconds.coerceAtLeast(0L) / 1000L).toInt()
     val hours = seconds / 3600
     val minutes = seconds % 3600 / 60
     val rest = seconds % 60
     return if (hours > 0) "%d:%02d:%02d".format(hours, minutes, rest) else "%d:%02d".format(minutes, rest)
+}
+
+/** A song's length, or a placeholder while it isn't known. */
+fun formatDuration(seconds: Int): String = if (seconds <= 0) "–:––" else formatTime(seconds * 1000L)
+
+fun formatBytes(bytes: Long): String = when {
+    bytes >= 1L shl 30 -> "%.1f GB".format(bytes / (1L shl 30).toDouble())
+    bytes >= 1L shl 20 -> "${bytes shr 20} MB"
+    else -> "${bytes shr 10} KB"
 }
 
 fun formatTotal(seconds: Int): String {

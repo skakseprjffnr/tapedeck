@@ -138,10 +138,10 @@ open its **Actions** tab, choose **Windows build** and click **Run workflow**.
 After about ten minutes, download **Tapedeck-windows** from the run's
 Artifacts. It contains:
 
-- `Tapedeck-0.7.0-windows-setup.exe`, an installer that needs no admin rights
-- `Tapedeck-0.7.0-windows-portable.zip`, which runs from any folder
+- `Tapedeck-0.8.0-windows-setup.exe`, an installer that needs no admin rights
+- `Tapedeck-0.8.0-windows-portable.zip`, which runs from any folder
 
-Pushing a tag such as `v0.7.0` builds the same files (and the Android app) and
+Pushing a tag such as `v0.8.0` builds the same files (and the Android app) and
 attaches them to that release, which makes them easy to share.
 
 **On a Windows PC.** Install Python 3.11 or newer, plus Inno Setup 6 if you
@@ -170,11 +170,28 @@ doesn't let apps run mpv or yt-dlp. It uses NewPipeExtractor, the library behind
 the NewPipe app, which handles YouTube's checks on the phone itself.
 
 It plays what you copy over from your computer: play, shuffle and repeat-one,
-in the background with lock-screen and notification controls. Songs you've
-played are kept on the phone (up to 3 GB, oldest first to go), so they start
-instantly and work offline. You can copy a song's links, remove songs, and
-delete categories. Adding songs on the phone itself isn't there yet: add them
-on your computer, then send the library again.
+in the background with lock-screen and notification controls. Drag the bar
+under the player to move back or forward through a song. You can copy a song's
+links, remove songs, and delete categories. Adding songs on the phone itself
+isn't there yet: add them on your computer, then send the library again.
+
+### Playing offline
+
+Copying the library sends the song list, not the audio. So right after an
+import, the phone starts saving every song from YouTube in the background.
+A progress bar at the top of the library (and a notification) shows how far
+along it is, for example "Saving songs for offline: 37 of 120". You can play
+songs meanwhile: saved ones, marked with a check, start instantly and work
+offline, and the rest stream.
+
+- Saving uses Wi-Fi only, unless you allow mobile data in the **⋮** menu (each
+  song is about 3 to 5 MB). Without Wi-Fi the bar says it's waiting.
+- It keeps going with the screen off, and picks up where it left off if the
+  app or the phone restarts.
+- Songs you remove, here or by sending an updated library, are deleted from
+  the phone.
+- The **⋮** menu also turns saving off, or deletes every saved song to free
+  space.
 
 ### Installing it
 
