@@ -13,6 +13,7 @@ import org.schabi.newpipe.extractor.downloader.Downloader
 import org.schabi.newpipe.extractor.downloader.Request
 import org.schabi.newpipe.extractor.downloader.Response
 import org.schabi.newpipe.extractor.exceptions.ReCaptchaException
+import org.schabi.newpipe.extractor.stream.AudioStream
 import org.schabi.newpipe.extractor.stream.DeliveryMethod
 import org.schabi.newpipe.extractor.stream.StreamInfo
 
@@ -29,6 +30,45 @@ object YouTube {
     private class Found(val url: String, val at: Long)
 
     private val found = ConcurrentHashMap<String, Found>()
+
+    /** Audio for songs saved from YouTube: "auto", "opus" or "aac", and "best", "medium" or "small". */
+    @Volatile
+    var preferredFormat = "auto"
+
+    @Volatile
+    var preferredQuality = "best"
+
+    // YouTube's own numbers for its audio streams (yt-dlp calls them format ids).
+    private val OPUS_ITAGS = setOf("249", "250", "251", "774")
+    private val AAC_ITAGS = setOf("139", "140", "141")
+
+    fun forgetAll() {
+        found.clear()
+    }
+
+    private fun kbps(stream: AudioStream): Int {
+        val raw = stream.averageBitrate
+        return if (raw > 10_000) raw / 1000 else raw  // some streams report bits per second
+    }
+
+    /** The stream for the chosen format (when the song has it) and quality. */
+    private fun pick(streams: List<AudioStream>): AudioStream? {
+        val itags = when (preferredFormat) {
+            "opus" -> OPUS_ITAGS
+            "aac" -> AAC_ITAGS
+            else -> null
+        }
+        val pool = if (itags == null) streams else streams.filter { itagOf(it.content) in itags }.ifEmpty { streams }
+        val target = when (preferredQuality) {
+            "medium" -> 128
+            "small" -> 64
+            else -> return pool.maxByOrNull { kbps(it) }
+        }
+        // The best at or under the target (a little leeway: YouTube's figures are averages),
+        // or the smallest there is.
+        return pool.filter { kbps(it) in 1..(target + 8) }.maxByOrNull { kbps(it) }
+            ?: pool.minByOrNull { kbps(it) }
+    }
     private var started = false
 
     @Synchronized
@@ -81,7 +121,7 @@ object YouTube {
         val chosen = if (itag != null) {
             streams.firstOrNull { itagOf(it.content) == itag } ?: throw FormatGone("That format of the song is gone")
         } else {
-            streams.maxByOrNull { it.averageBitrate } ?: throw IOException("YouTube didn't offer audio for this song")
+            pick(streams) ?: throw IOException("YouTube didn't offer audio for this song")
         }
         found[videoId] = Found(chosen.content, System.currentTimeMillis())
         return chosen.content

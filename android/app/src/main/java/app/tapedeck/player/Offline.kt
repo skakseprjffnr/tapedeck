@@ -128,6 +128,49 @@ object Offline {
     private val _ageRestricted = MutableStateFlow<Set<String>>(emptySet())
     val ageRestricted: StateFlow<Set<String>> = _ageRestricted.asStateFlow()
 
+    /** Songs saved by hand: kept, and saved even with automatic saving off. */
+    private val _pinned = MutableStateFlow<Set<String>>(emptySet())
+    val pinned: StateFlow<Set<String>> = _pinned.asStateFlow()
+
+    private fun setPinned(next: Set<String>) {
+        _pinned.value = next
+        preferencesInstance?.edit()?.putStringSet("pinned", HashSet(next))?.apply()
+    }
+
+    /** Save these songs now, and keep them even with automatic saving off. Main thread. */
+    fun pin(context: Context, songIds: Collection<String>, categories: List<Category>) {
+        val app = context.applicationContext
+        preferences(app)
+        setPinned(_pinned.value + songIds)
+        sync(app, categories, retryFailed = true)
+    }
+
+    /** Stop keeping these; with automatic saving off, their saved copies are deleted. */
+    fun unpin(context: Context, songIds: Collection<String>, categories: List<Category>) {
+        val app = context.applicationContext
+        preferences(app)
+        setPinned(_pinned.value - songIds.toSet())
+        if (!savingEnabled(app)) {
+            for (id in songIds) {
+                clearOrigin(id)
+                send { DownloadService.sendRemoveDownload(app, SongDownloadService::class.java, id, false) }
+            }
+        }
+        sync(app, categories)
+    }
+
+    fun audioFormat(context: Context): String = preferences(context).getString("format", "auto") ?: "auto"
+
+    fun audioQuality(context: Context): String = preferences(context).getString("quality", "best") ?: "best"
+
+    /** The format and quality for songs saved from YouTube from now on. */
+    fun setAudio(context: Context, format: String, quality: String) {
+        preferences(context).edit().putString("format", format).putString("quality", quality).apply()
+        YouTube.preferredFormat = format
+        YouTube.preferredQuality = quality
+        YouTube.forgetAll()  // lookups made with the old choice
+    }
+
     private fun markAgeRestricted(id: String, restricted: Boolean) {
         val now = _ageRestricted.value
         if ((id in now) == restricted) return
@@ -308,6 +351,9 @@ object Offline {
         ?: context.applicationContext.getSharedPreferences("offline", Context.MODE_PRIVATE).also {
             preferencesInstance = it
             _ageRestricted.value = it.getStringSet("age_restricted", emptySet())?.toSet() ?: emptySet()
+            _pinned.value = it.getStringSet("pinned", emptySet())?.toSet() ?: emptySet()
+            YouTube.preferredFormat = it.getString("format", "auto") ?: "auto"
+            YouTube.preferredQuality = it.getString("quality", "best") ?: "best"
         }
 
     fun savingEnabled(context: Context): Boolean = preferences(context).getBoolean("save", true)
@@ -382,11 +428,13 @@ object Offline {
      */
     fun sync(context: Context, categories: List<Category>, retryFailed: Boolean = false) {
         val app = context.applicationContext
-        val ids = categories.flatMapTo(HashSet()) { category -> category.songs.map { it.videoId } }
-        wanted = ids
+        val library = categories.flatMapTo(HashSet()) { category -> category.songs.map { it.videoId } }
         val manager = manager(app)
         val store = cache(app)
         val enabled = savingEnabled(app)
+        // Automatic saving keeps every song; otherwise only the ones saved by hand.
+        val ids = if (enabled) library else library.intersect(_pinned.value)
+        wanted = ids
         val retry = retryFailed || firstSync
         firstSync = false
         if (retry) restarts.clear()  // songs that gave up get their fresh starts back
@@ -403,13 +451,18 @@ object Offline {
             // Played-but-not-saved songs live in the store too: drop the ones no longer in the library.
             for (key in store.keys.toList()) {
                 val id = Uri.parse(key).getQueryParameter("v")
-                if (id != null && id !in ids && id !in known) runCatching { store.removeResource(key) }
+                if (id != null && id !in library && id !in known) runCatching { store.removeResource(key) }
             }
             main.post {
-                for (id in known.keys) {
-                    if (id !in ids) send { DownloadService.sendRemoveDownload(app, SongDownloadService::class.java, id, false) }
+                for ((id, state) in known) {
+                    // Gone from the library, or (with automatic saving off) not saved by hand and
+                    // not finished: stop it. Songs already saved stay.
+                    val unwanted = id !in ids && state != Download.STATE_COMPLETED
+                    if (id !in library || unwanted) {
+                        send { DownloadService.sendRemoveDownload(app, SongDownloadService::class.java, id, false) }
+                    }
                 }
-                if (enabled) {
+                run {
                     val restricted = _ageRestricted.value
                     val offered = computer?.songs ?: emptySet()
                     for (id in ids) {
@@ -423,8 +476,6 @@ object Offline {
                     // The download manager starts out paused, and only the saving service resumes
                     // it. Songs queued before the app restarted wait for that, so start it now.
                     send { DownloadService.sendResumeDownloads(app, SongDownloadService::class.java, false) }
-                } else {
-                    send { DownloadService.sendPauseDownloads(app, SongDownloadService::class.java, false) }
                 }
                 refresh()
             }
@@ -481,7 +532,7 @@ object Offline {
         val fromPcSpeed = computerSpeed
         val fromYtSpeed = youtubeSpeed
         val connected = computer != null
-        if (enabled && manager.downloadsPaused) {  // should never stay paused while saving is on
+        if (manager.downloadsPaused) {  // nothing should stay paused: songs saved by hand run too
             appContext?.let { app -> send { DownloadService.sendResumeDownloads(app, SongDownloadService::class.java, false) } }
         }
         io.execute {
@@ -576,13 +627,7 @@ object Offline {
     fun setSaving(context: Context, on: Boolean, categories: List<Category>) {
         val app = context.applicationContext
         preferences(app).edit().putBoolean("save", on).apply()
-        if (on) {
-            send { DownloadService.sendResumeDownloads(app, SongDownloadService::class.java, false) }
-            sync(app, categories)
-        } else {
-            send { DownloadService.sendPauseDownloads(app, SongDownloadService::class.java, false) }
-            refresh()
-        }
+        sync(app, categories)  // off: songs saved by hand carry on; unfinished others stop
     }
 
     fun setMobileData(context: Context, allowed: Boolean) {
@@ -595,6 +640,7 @@ object Offline {
     fun deleteSaved(context: Context) {
         val app = context.applicationContext
         preferences(app).edit().putBoolean("save", false).apply()
+        setPinned(emptySet())
         send { DownloadService.sendRemoveAllDownloads(app, SongDownloadService::class.java, false) }
         val store = cache(app)
         io.execute {

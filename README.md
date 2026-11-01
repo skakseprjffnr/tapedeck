@@ -48,6 +48,8 @@ python tapedeck.py
 | Double-click a song's **title** | Rename it (clear the text to go back to the video's title) |
 | Right-click any song | **Add to categories…**: tick every category it should be in, untick to take it out. Also works on the song in the bottom bar |
 | Right-click a song, **Copy YouTube link** or **Copy YouTube Music link** | Put the song's link on the clipboard. Also works on the song in the bottom bar |
+| Right-click a song, **Save for instant play** | Save it now, and keep it saved even with automatic saving off |
+| Right-click a category, **Save all for instant play** | The same for all its songs (also the download button on its page) |
 | Right-click a song, **Remove from this category** | Take it out of just that category |
 | Right-click a category or its tab | Rename or delete the category |
 
@@ -103,6 +105,24 @@ title, length, and your accent color.
   duplicates.
 - The same code also works in **+** → **Import Playlist** on another computer,
   for moving your whole library there.
+
+## Audio quality and saving by hand
+
+Settings, under **Audio**, picks the format and quality of songs from now on:
+
+- **Format**: the best available (usually Opus), Opus (.webm), AAC (.m4a), or MP3.
+  Opus and AAC come from YouTube as they are; MP3 is converted with ffmpeg
+  (`sudo pacman -S ffmpeg`; on Windows, `winget install ffmpeg`), which takes a
+  little longer and loses a little quality.
+- **Quality**: best, about 128 kbps, or about 64 kbps (the smallest files).
+
+Songs already saved keep their format. Streaming uses the same choice (an MP3
+choice streams the original).
+
+**Save songs for instant play** saves every song automatically. With it off,
+only the songs and categories you save by hand (from their right-click menus,
+or the download button on a category's page) are saved, and they stay saved.
+With it on, saving by hand puts those songs first in line.
 
 ## Age-restricted songs
 
@@ -169,10 +189,10 @@ open its **Actions** tab, choose **Windows build** and click **Run workflow**.
 After about ten minutes, download **Tapedeck-windows** from the run's
 Artifacts. It contains:
 
-- `Tapedeck-0.10.0-windows-setup.exe`, an installer that needs no admin rights
-- `Tapedeck-0.10.0-windows-portable.zip`, which runs from any folder
+- `Tapedeck-0.11.0-windows-setup.exe`, an installer that needs no admin rights
+- `Tapedeck-0.11.0-windows-portable.zip`, which runs from any folder
 
-Pushing a tag such as `v0.10.0` builds the same files (and the Android app) and
+Pushing a tag such as `v0.11.0` builds the same files (and the Android app) and
 attaches them to that release, which makes them easy to share.
 
 **On a Windows PC.** Install Python 3.11 or newer, plus Inno Setup 6 if you
@@ -244,7 +264,12 @@ file managers can't open them):
   with a live preview and a warning if a color is hard to see on the black
   background. **Use my computer's color** (on at first) brings the computer's
   color along whenever you copy your library; picking a color here turns it off.
-- **Saving songs**: saving on or off, mobile data, and deleting saved songs.
+- **Audio quality**: format (automatic, Opus, AAC) and quality (best, 128 kbps,
+  64 kbps) for songs saved from YouTube. Songs copied from your computer come in
+  its format, so choose MP3 there if you want MP3s.
+- **Saving songs**: saving every song automatically, mobile data, and deleting
+  saved songs. With automatic saving off, a song's or category's menu saves it
+  by hand (**Save to this phone**), and **Remove from this phone** deletes it.
 
 ### Installing it
 

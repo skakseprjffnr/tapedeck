@@ -66,7 +66,7 @@ from PySide6.QtWidgets import (
 APP_NAME = "Tapedeck"
 APP_ID = "tapedeck"
 IS_WINDOWS = sys.platform == "win32"
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 
 # ── Design tokens ────────────────────────────────────────────────────────────
 # Strict black and white. The accent only marks actions and what is playing.
@@ -1311,6 +1311,24 @@ def add_link_actions(menu: QMenu, ctx: Ctx, video_id: str) -> None:
         lambda: copy_text(ctx, music_url(video_id), "YouTube Music link copied"))
 
 
+def category_videos(library: Library, category_id: str) -> list[str]:
+    category = library.category(category_id)
+    if category is None:
+        return []
+    return [song.video_id for song in (library.song(sid) for sid in category.song_ids) if song]
+
+
+def add_save_actions(menu: QMenu, ctx: Ctx, category_id: str):
+    """"Save all for instant play", and with automatic saving off "Delete saved copies"."""
+    videos = category_videos(ctx.library, category_id)
+    save = menu.addAction("Save all for instant play")
+    save.setEnabled(any(not ctx.cache.has(video_id) for video_id in videos))
+    unsave = None
+    if not ctx.cache.enabled and any(ctx.cache.has(video_id) for video_id in videos):
+        unsave = menu.addAction("Delete saved copies")
+    return save, unsave
+
+
 def song_links(library: Library, category: Category) -> str:
     return "\n".join(watch_url(song.video_id) for song in
                      (library.song(sid) for sid in category.song_ids) if song is not None)
@@ -2027,7 +2045,7 @@ class DownloadJob(QObject):
         self._timer.timeout.connect(self._timed_out)
 
     def start(self) -> None:
-        args = ["-f", AUDIO_FORMAT, "--no-playlist", "--no-progress", "--quiet", "--no-mtime",
+        args = [*save_format_args(), "--no-playlist", "--no-progress", "--quiet", "--no-mtime",
                 "--socket-timeout", "15", "--retries", "3",
                 "-P", str(self.folder), "-o", "%(id)s.%(ext)s",
                 "--print", "after_move:filepath", "--no-simulate"]
@@ -2123,6 +2141,9 @@ class AudioCache(QObject):
         self._seq = itertools.count()
         self._active: dict[str, DownloadJob] = {}
         self._retry_at: dict[str, float] = {}
+        # Songs saved by hand: kept saved even with automatic saving off.
+        pinned = settings.get("pinned_songs", [])
+        self.pinned: set[str] = {v for v in pinned if isinstance(v, str)} if isinstance(pinned, list) else set()
         self._paused_until = 0.0
         self._resume = QTimer(self)
         self._resume.setSingleShot(True)
@@ -2182,7 +2203,7 @@ class AudioCache(QObject):
         """Save this song. Lower priority numbers go first."""
         if not video_id or video_id in self.files or video_id in self._active:
             return
-        if not (self.enabled or force):
+        if not (self.enabled or force or video_id in self.pinned):
             return
         if priority > Priority.NOW and time.monotonic() < self._retry_at.get(video_id, 0.0):
             return
@@ -2205,13 +2226,14 @@ class AudioCache(QObject):
     def set_enabled(self, enabled: bool) -> None:
         self.enabled = enabled
         self.settings.set("save_songs", enabled)
-        if not enabled:
+        if not enabled:  # songs saved by hand (pinned) carry on
+            pinned = self.pinned
             for video_id, job in list(self._active.items()):
-                if job.priority > Priority.NOW:
+                if job.priority > Priority.NOW and video_id not in pinned:
                     self._active.pop(video_id).cancel()
-            self._heap = [item for item in self._heap if item[0] <= Priority.NOW]
+            self._heap = [item for item in self._heap if item[0] <= Priority.NOW or item[2] in pinned]
             heapq.heapify(self._heap)
-            self._queued = {v: p for v, p in self._queued.items() if p <= Priority.NOW}
+            self._queued = {v: p for v, p in self._queued.items() if p <= Priority.NOW or v in pinned}
         self.changed.emit()
 
     def forget(self, video_ids: list[str]) -> None:
@@ -2229,11 +2251,32 @@ class AudioCache(QObject):
         self.changed.emit()
         self._pump()
 
+    def pin(self, video_ids: list[str]) -> None:
+        """Save these songs now, and keep them saved even with automatic saving off."""
+        fresh = [video_id for video_id in video_ids if video_id]
+        self.pinned.update(fresh)
+        self.settings.set("pinned_songs", sorted(self.pinned))
+        for video_id in fresh:
+            self._retry_at.pop(video_id, None)
+            self.want(video_id, Priority.UPCOMING, force=True)
+        self.changed.emit()
+
+    def unpin(self, video_ids: list[str]) -> None:
+        """Stop keeping these; with automatic saving off, their saved copies are deleted."""
+        self.pinned.difference_update(video_ids)
+        self.settings.set("pinned_songs", sorted(self.pinned))
+        if not self.enabled:
+            self.forget(list(video_ids))
+        self.changed.emit()
+
     def retry_failed(self) -> None:
         """Songs that couldn't be saved (age-restricted ones, say) may try again right away."""
         self._retry_at.clear()
 
     def keep_only(self, video_ids: set[str]) -> None:
+        if self.pinned - video_ids:  # songs that left the library aren't pinned any more
+            self.pinned &= video_ids
+            self.settings.set("pinned_songs", sorted(self.pinned))
         stale = [video_id for video_id in self.files if video_id not in video_ids]
         if stale:
             log.info("Deleting %d saved songs that aren't in the library", len(stale))
@@ -2378,6 +2421,7 @@ class AccountCheck(QObject):
         super().__init__(parent)
         self.browser, self.cookie_file, self.video_id = browser, cookie_file, video_id
         self.dump = ""
+        self.private = ""
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._timed_out)
@@ -2398,8 +2442,11 @@ class AccountCheck(QObject):
             return
         folder = cookie_copies_folder()
         folder.mkdir(parents=True, exist_ok=True)
-        handle, self.dump = tempfile.mkstemp(prefix="check-", suffix=".txt", dir=str(folder))
-        os.close(handle)
+        # yt-dlp reads a cookies file that already exists before using the browser's, and an
+        # empty one is "not a cookies file". So the dump goes in a fresh private folder and
+        # yt-dlp creates it there as it exits.
+        self.private = tempfile.mkdtemp(prefix="check-", dir=str(folder))
+        self.dump = str(Path(self.private) / "cookies.txt")
         process = QProcess(self)
         process.setProgram(tool("yt-dlp"))
         # Reading the browser's cookies and saving them to the private dump file shows what
@@ -2433,7 +2480,7 @@ class AccountCheck(QObject):
             cookies = Path(self.dump).read_text(encoding="utf-8", errors="replace")
         except OSError:
             cookies = ""
-        Path(self.dump).unlink(missing_ok=True)
+        self._clean_up()
         if youtube_signed_in(cookies):
             self.finished.emit(True, f"Signed in: {self.name} has a YouTube sign-in. "
                                      "Age-restricted songs will play and save.")
@@ -2467,8 +2514,13 @@ class AccountCheck(QObject):
     def _failed_to_start(self, process: QProcess, error) -> None:
         if error == QProcess.ProcessError.FailedToStart:
             self._timer.stop()
-            Path(self.dump).unlink(missing_ok=True)
+            self._clean_up()
             self.finished.emit(False, "Checking needs yt-dlp. " + install_hint("yt-dlp"))
+
+    def _clean_up(self) -> None:
+        """The dump holds session cookies: it goes as soon as it's read."""
+        if self.private:
+            shutil.rmtree(self.private, ignore_errors=True)
 
     def _timed_out(self) -> None:
         if self._process is not None:
@@ -2488,6 +2540,54 @@ def age_restricted_hint() -> str:
 
 
 AUDIO_FORMAT = "bestaudio/best"
+
+# ── Audio format and quality ─────────────────────────────────────────────────
+# Opus and AAC come from YouTube as they are, so they cost nothing extra; yt-dlp just prefers
+# that codec and the bitrate closest under the target. MP3 is converted by ffmpeg.
+AUDIO_FORMATS = (("auto", "Best available format"), ("opus", "Opus (.webm)"),
+                 ("aac", "AAC (.m4a)"), ("mp3", "MP3 (converted)"))
+AUDIO_QUALITIES = (("best", "Best quality"), ("medium", "About 128 kbps"),
+                   ("small", "About 64 kbps (smallest)"))
+AUDIO_CHOICE = {"format": "auto", "quality": "best"}
+MP3_BITRATES = {"best": "0", "medium": "128K", "small": "64K"}  # 0: best VBR, about 245 kbps
+
+
+def set_audio_choice(fmt: str = "auto", quality: str = "best") -> None:
+    AUDIO_CHOICE["format"] = fmt if fmt in dict(AUDIO_FORMATS) else "auto"
+    AUDIO_CHOICE["quality"] = quality if quality in dict(AUDIO_QUALITIES) else "best"
+
+
+def ffmpeg_available() -> bool:
+    return shutil.which(tool("ffmpeg")) is not None or shutil.which("ffmpeg") is not None
+
+
+def ffmpeg_hint() -> str:
+    if IS_WINDOWS:
+        return ("MP3 needs ffmpeg, which Tapedeck for Windows doesn't include. Install it "
+                "(winget install ffmpeg), then restart Tapedeck.")
+    return "MP3 needs ffmpeg. " + install_hint("ffmpeg")
+
+
+def audio_sort() -> list[str]:
+    """yt-dlp's format preference for the chosen codec and quality (no re-encoding)."""
+    parts = {"opus": ["acodec:opus"], "aac": ["acodec:aac"]}.get(AUDIO_CHOICE["format"], [])
+    target = {"medium": "abr:128", "small": "abr:64"}.get(AUDIO_CHOICE["quality"])
+    if target:
+        parts.append(target)
+    return ["-S", ",".join(parts)] if parts else []
+
+
+def stream_format_args() -> list[str]:
+    """What to stream: the chosen codec and quality (an MP3 choice streams the original)."""
+    return ["-f", AUDIO_FORMAT, *audio_sort()]
+
+
+def save_format_args() -> list[str]:
+    """What to save: as streamed, or converted to MP3 when that's chosen and ffmpeg is there."""
+    if AUDIO_CHOICE["format"] == "mp3" and ffmpeg_available():
+        return ["-f", AUDIO_FORMAT, "-x", "--audio-format", "mp3",
+                "--audio-quality", MP3_BITRATES[AUDIO_CHOICE["quality"]]]
+    return stream_format_args()
 FORBIDDEN = re.compile(r"\b403\b|forbidden", re.IGNORECASE)
 STREAM_URL = re.compile(r"https?://[^\s'\"]*googlevideo\.com[^\s'\"]*")
 GENERIC_LINE = re.compile(
@@ -2622,7 +2722,7 @@ class ResolveJob(QObject):
 
     def start(self) -> None:
         process = QProcess(self)
-        args = ["-J", "--no-playlist", "-f", AUDIO_FORMAT, "--socket-timeout", "15",
+        args = ["-J", "--no-playlist", *stream_format_args(), "--socket-timeout", "15",
                 *account_args(process), watch_url(self.video_id)]
         process.setProgram(tool("yt-dlp"))
         process.setArguments(args)
@@ -4176,6 +4276,12 @@ def draw_glyph(painter: QPainter, kind: str, center: QPointF, color: QColor,
             head.lineTo(0.0, -6.1)
             head.lineTo(3.1, -3.0)
             painter.drawPath(head)
+        elif kind == "download":
+            painter.setPen(QPen(color, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                                Qt.PenJoinStyle.RoundJoin))
+            painter.drawLine(QPointF(0.0, -7.0), QPointF(0.0, 3.0))
+            painter.drawPolyline([QPointF(-4.0, -1.0), QPointF(0.0, 3.2), QPointF(4.0, -1.0)])
+            painter.drawLine(QPointF(-6.0, 7.0), QPointF(6.0, 7.0))
         elif kind == "phone":
             painter.setPen(QPen(color, 1.6))
             painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -4989,11 +5095,24 @@ class SongRow(QFrame):
         menu = QMenu(self)
         add = menu.addAction("Add to categories…")
         add_link_actions(menu, self.ctx, self.video_id)
+        cache = self.ctx.cache
+        save = unsave = None
+        if not cache.has(self.video_id):
+            save = menu.addAction("Save for instant play")
+        elif not cache.enabled:
+            unsave = menu.addAction("Delete the saved copy")
         menu.addSeparator()
         remove = menu.addAction("Remove from this category")
         chosen = menu.exec(self.mapToGlobal(pos))
-        if chosen == add and self.ctx.window is not None:
-            self.ctx.window.open_song_categories(self.song_id)
+        window = self.ctx.window
+        if chosen is None or window is None:
+            return
+        if chosen == add:
+            window.open_song_categories(self.song_id)
+        elif save is not None and chosen == save:
+            window.save_songs([self.video_id], "the song")
+        elif unsave is not None and chosen == unsave:
+            window.unsave_songs([self.video_id], "the song")
         elif chosen == remove:
             self.song_list.removeRequested.emit(self.song_id)
 
@@ -5302,11 +5421,14 @@ class CategoryCard(QFrame):
         rename = menu.addAction("Rename category")
         share = menu.addAction("Share or export…")
         share.setEnabled(bool(category and category.song_ids))
+        save, unsave = add_save_actions(menu, self.ctx, self.category_id)
         menu.addSeparator()
         delete = menu.addAction("Delete category…")
         chosen = menu.exec(self.mapToGlobal(pos))
         if chosen == rename:
             self.title.begin()
+        elif chosen is not None and chosen in (save, unsave) and self.ctx.window is not None:
+            self.ctx.window.save_category(self.category_id, keep=chosen == save)
         elif chosen == share and self.ctx.window is not None:
             self.ctx.window.open_share(self.category_id)
         elif chosen == delete and self.ctx.window is not None:
@@ -6264,7 +6386,7 @@ ACCOUNT_HINT = ("Age-restricted songs play only for a signed-in YouTube account.
 class SettingsSheet(Sheet):
     """Accent color, saving songs, the YouTube account, and where songs are kept."""
 
-    submitted = Signal(str, bool, str, str)  # accent, save songs, sign-in browser, cookies file
+    submitted = Signal(object)  # {"accent", "saving", "browser", "cookie_file", "format", "quality"}
 
     def __init__(self, ctx: Ctx) -> None:
         super().__init__("Settings", primary="Save")
@@ -6315,6 +6437,24 @@ class SettingsSheet(Sheet):
         open_button.clicked.connect(lambda: open_folder(AUDIO_DIR))
         folder.addWidget(open_button, 0, Qt.AlignmentFlag.AlignTop)
         self.body.addLayout(folder)
+
+        self.body.addWidget(plain_label("Audio", "FieldLabel", make_font(13, QFont.Weight.Medium)))
+        audio = QHBoxLayout()
+        audio.setSpacing(z(8))
+        self.format_choice, self.quality_choice = QComboBox(), QComboBox()
+        for box, options, current in ((self.format_choice, AUDIO_FORMATS, AUDIO_CHOICE["format"]),
+                                      (self.quality_choice, AUDIO_QUALITIES, AUDIO_CHOICE["quality"])):
+            box.setObjectName("Choice")
+            box.setFont(make_font(13))
+            for key, name in options:
+                box.addItem(name, key)
+            box.setCurrentIndex(max(0, box.findData(current)))
+            box.currentIndexChanged.connect(self._audio_changed)
+            audio.addWidget(box, 1)
+        self.body.addLayout(audio)
+        self.audio_hint = wrapped_label("", "FieldHint", make_font(12), inner, lines=2)
+        self.body.addWidget(self.audio_hint)
+        self._audio_changed()
 
         self.body.addWidget(plain_label("YouTube account", "FieldLabel",
                                         make_font(13, QFont.Weight.Medium)))
@@ -6409,6 +6549,26 @@ class SettingsSheet(Sheet):
             text = ACCOUNT_HINT
         self._set_hint(text, error=False)
 
+    @property
+    def audio(self) -> tuple[str, str]:
+        """(format, quality) as chosen."""
+        fmt, quality = self.format_choice.currentData(), self.quality_choice.currentData()
+        return (fmt if isinstance(fmt, str) and fmt in dict(AUDIO_FORMATS) else "auto",
+                quality if isinstance(quality, str) and quality in dict(AUDIO_QUALITIES) else "best")
+
+    def _audio_changed(self, *_args) -> None:
+        fmt, _quality = self.audio
+        if fmt == "mp3" and not ffmpeg_available():
+            text, error = ffmpeg_hint() + " Until then, songs are saved as they come.", True
+        elif fmt == "mp3":
+            text, error = ("MP3 is converted after downloading, which takes a little longer and "
+                           "loses a little quality. Songs already saved keep their format."), False
+        else:
+            text, error = ("New songs are saved and streamed this way, straight from YouTube "
+                           "without re-encoding. Songs already saved keep theirs."), False
+        self.audio_hint.setText(text)
+        set_flag(self.audio_hint, "error", error)
+
     def _set_hint(self, text: str, error: bool) -> None:
         self.account_hint.setText(text)
         set_flag(self.account_hint, "error", error)
@@ -6438,7 +6598,10 @@ class SettingsSheet(Sheet):
         color = self.color
         if color is not None:
             browser, cookie_file = self.account
-            self.submitted.emit(color, self.save_check.isChecked(), browser, cookie_file)
+            fmt, quality = self.audio
+            self.submitted.emit({"accent": color, "saving": self.save_check.isChecked(),
+                                 "browser": browser, "cookie_file": cookie_file,
+                                 "format": fmt, "quality": quality})
 
 
 SONG_CATEGORIES_HINT = ("The song is in the ticked categories. Tick others to add it to their "
@@ -6767,6 +6930,9 @@ class CategoryPage(QWidget):
         heading.addSpacing(z(4))
         heading.addWidget(self.meta)
         header.addLayout(heading, 1)
+        self.save_button = GlyphButton("download", size=44, radius=13, variant="outline")
+        self.save_button.setToolTip("Save these songs for instant play")
+        header.addWidget(self.save_button, 0, Qt.AlignmentFlag.AlignBottom)
         self.share_button = GlyphButton("share", size=44, radius=13, variant="outline")
         self.share_button.setToolTip("Share or export")
         self.shuffle_button = GlyphButton("shuffle", size=44, radius=13, variant="toggle")
@@ -6793,6 +6959,8 @@ class CategoryPage(QWidget):
             lambda: toggle_category_shuffle(ctx.player, category_id))
         self.share_button.clicked.connect(
             lambda: ctx.window.open_share(category_id) if ctx.window is not None else None)
+        self.save_button.clicked.connect(
+            lambda: ctx.window.save_category(category_id) if ctx.window is not None else None)
         self.refresh_heading()
         self.sync()
 
@@ -6812,6 +6980,7 @@ class CategoryPage(QWidget):
         self.empty.setVisible(not category.song_ids)
         self.list.setVisible(bool(category.song_ids))
         self.share_button.setEnabled(bool(category.song_ids))
+        self.save_button.setEnabled(bool(category.song_ids))
         self._update_meta()
         sync_category_controls(self.ctx, self.category_id, self.play_button, self.shuffle_button)
 
@@ -7133,12 +7302,15 @@ class SideBar(QFrame):
         rename = menu.addAction("Rename category")
         share = menu.addAction("Share or export…")
         share.setEnabled(bool(category and category.song_ids))
+        save, unsave = add_save_actions(menu, self.ctx, tab.key)
         menu.addSeparator()
         delete = menu.addAction("Delete category…")
         chosen = menu.exec(tab.mapToGlobal(pos))
         if window is None:
             return
-        if chosen == rename:
+        if chosen is not None and chosen in (save, unsave):
+            window.save_category(tab.key, keep=chosen == save)
+        elif chosen == rename:
             window.rename_category(tab.key)
         elif chosen == share:
             window.open_share(tab.key)
@@ -7833,8 +8005,14 @@ class MainWindow(QMainWindow):
         sheet = SettingsSheet(self.ctx)
         overlay = self._open_sheet(sheet)
 
-        def save(color: str, saving: bool, browser: str, cookie_file: str) -> None:
+        def save(choice: dict) -> None:
             overlay.dismiss()
+            color, saving = choice["accent"], choice["saving"]
+            browser, cookie_file = choice["browser"], choice["cookie_file"]
+            if (choice["format"], choice["quality"]) != (AUDIO_CHOICE["format"], AUDIO_CHOICE["quality"]):
+                set_audio_choice(choice["format"], choice["quality"])
+                self.ctx.settings.set("audio_format", AUDIO_CHOICE["format"])
+                self.ctx.settings.set("audio_quality", AUDIO_CHOICE["quality"])
             cache = self.ctx.cache
             if saving != cache.enabled:
                 cache.set_enabled(saving)
@@ -7847,6 +8025,32 @@ class MainWindow(QMainWindow):
                 later(10, lambda: self.notify(message))  # after any rebuild, on the new window
 
         sheet.submitted.connect(save)
+
+    def save_songs(self, video_ids: list[str], what: str, source: str = "") -> None:
+        cache = self.ctx.cache
+        missing = [video_id for video_id in video_ids if not cache.has(video_id)]
+        cache.pin(video_ids)
+        if not missing:
+            self.notify(f"{what[0].upper() + what[1:]} {'is' if len(video_ids) == 1 else 'are'} "
+                        "saved already")
+        elif len(video_ids) == 1:
+            self.notify(f"Saving {what}")
+        else:
+            self.notify(f"Saving {song_count(len(missing))}" + (f" from {source}" if source else ""))
+
+    def unsave_songs(self, video_ids: list[str], what: str) -> None:
+        self.ctx.cache.unpin(video_ids)
+        self.notify(f"Deleted the saved {'copy' if len(video_ids) == 1 else 'copies'} of {what}")
+
+    def save_category(self, category_id: str, keep: bool = True) -> None:
+        category = self.ctx.library.category(category_id)
+        videos = category_videos(self.ctx.library, category_id)
+        if category is None or not videos:
+            return
+        if keep:
+            self.save_songs(videos, f"the songs in {category.title}", category.title)
+        else:
+            self.unsave_songs(videos, f"the songs in {category.title}")
 
     def apply_account(self, browser: str, cookie_file: str) -> str:
         """Use a new YouTube sign-in; songs that failed for lack of one try again."""
@@ -8282,6 +8486,8 @@ def main() -> int:
 
     ctx = Ctx()
     shutil.rmtree(cookie_copies_folder(), ignore_errors=True)  # copies left by a crash
+    set_audio_choice(ctx.settings.get("audio_format", "auto") or "auto",
+                     ctx.settings.get("audio_quality", "best") or "best")
     set_account(ctx.settings.get("account_browser", "") or "", ctx.settings.get("account_file", "") or "")
     if account_label():
         log.info("Signing in to YouTube with %s", account_label())

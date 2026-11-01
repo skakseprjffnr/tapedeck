@@ -55,6 +55,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -302,6 +303,15 @@ fun TapedeckApp(store: LibraryStore, controller: MediaController?) {
                                     playingId = player.videoId,
                                     saved = saved,
                                     restricted = restricted,
+                                    automatic = status.enabled,
+                                    onSaveSongs = { songIds ->
+                                        Offline.pin(context, songIds, store.categories.value)
+                                        val what = if (songIds.size == 1) "the song" else songCount(songIds.size)
+                                        Toast.makeText(context, "Saving $what to this phone", Toast.LENGTH_SHORT).show()
+                                    },
+                                    onUnsaveSongs = { songIds ->
+                                        Offline.unpin(context, songIds, store.categories.value)
+                                    },
                                     store = store,
                                     onBack = { screen = Screen.Library },
                                     onPlay = { index, shuffle -> playCategory(controller, category, index, shuffle) },
@@ -478,7 +488,7 @@ private fun SavingPanel(
                 if (status.youtubeSpeed > 0) add("from YouTube at ${formatSpeed(status.youtubeSpeed)}")
             }
             val detail = when {
-                !status.enabled -> "Saving is off."
+                !status.enabled -> "Saving the songs you chose."
                 status.waitingForNetwork -> "Waiting for an internet connection."
                 status.waitingForWifi -> "Waiting for Wi-Fi."
                 sources.isNotEmpty() -> "Copying ${sources.joinToString(" and ")}."
@@ -486,7 +496,7 @@ private fun SavingPanel(
             }
             Text("$detail ${formatBytes(status.bytes)} used.", color = Smoke, style = MaterialTheme.typography.bodySmall)
             if (!status.enabled) {
-                TextButton(onClick = onTurnOn) { Text("Turn saving on") }
+                TextButton(onClick = onTurnOn) { Text("Save every song") }
             } else if (status.waitingForWifi && !status.waitingForNetwork) {
                 TextButton(onClick = onAllowMobileData) { Text("Use mobile data too") }
             } else if (status.youtubeSpeed > 0 && !status.computerConnected) {
@@ -553,6 +563,9 @@ private fun CategoryScreen(
     playingId: String?,
     saved: Set<String>,
     restricted: Set<String>,
+    automatic: Boolean,
+    onSaveSongs: (List<String>) -> Unit,
+    onUnsaveSongs: (List<String>) -> Unit,
     store: LibraryStore,
     onBack: () -> Unit,
     onPlay: (Int?, Boolean) -> Unit,
@@ -575,6 +588,24 @@ private fun CategoryScreen(
                             Icon(Icons.Filled.MoreVert, contentDescription = "More")
                         }
                         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                            val songIds = category.songs.map { it.videoId }
+                            DropdownMenuItem(
+                                text = { Text("Save all to this phone") },
+                                enabled = songIds.any { it !in saved },
+                                onClick = {
+                                    menu = false
+                                    onSaveSongs(songIds)
+                                },
+                            )
+                            if (!automatic && songIds.any { it in saved }) {
+                                DropdownMenuItem(
+                                    text = { Text("Remove all from this phone") },
+                                    onClick = {
+                                        menu = false
+                                        onUnsaveSongs(songIds)
+                                    },
+                                )
+                            }
                             DropdownMenuItem(
                                 text = { Text("Delete this category") },
                                 onClick = {
@@ -618,6 +649,8 @@ private fun CategoryScreen(
                     playing = song.videoId == playingId,
                     saved = song.videoId in saved,
                     restricted = song.videoId in restricted && song.videoId !in saved,
+                    onSave = { onSaveSongs(listOf(song.videoId)) },
+                    onUnsave = if (!automatic) ({ onUnsaveSongs(listOf(song.videoId)) }) else null,
                     onClick = { onPlay(index, false) },
                     onRemove = { store.removeSong(category.id, song.videoId) },
                 )
@@ -652,6 +685,8 @@ private fun SongRow(
     playing: Boolean,
     saved: Boolean,
     restricted: Boolean,
+    onSave: () -> Unit,
+    onUnsave: (() -> Unit)?,
     onClick: () -> Unit,
     onRemove: () -> Unit,
 ) {
@@ -709,6 +744,17 @@ private fun SongRow(
                     menu = false
                     copy(song.musicUrl, "YouTube Music")
                 })
+                if (!saved) {
+                    DropdownMenuItem(text = { Text("Save to this phone") }, onClick = {
+                        menu = false
+                        onSave()
+                    })
+                } else if (onUnsave != null) {
+                    DropdownMenuItem(text = { Text("Remove from this phone") }, onClick = {
+                        menu = false
+                        onUnsave()
+                    })
+                }
                 DropdownMenuItem(text = { Text("Remove from this category") }, onClick = {
                     menu = false
                     onRemove()
@@ -930,6 +976,8 @@ private fun SettingsScreen(
         if (normalizeHex(typed) != accentHex) typed = accentHex
     }
     var confirmDelete by remember { mutableStateOf(false) }
+    var audioFormat by remember { mutableStateOf(Offline.audioFormat(context)) }
+    var audioQuality by remember { mutableStateOf(Offline.audioQuality(context)) }
     val accent = MaterialTheme.colorScheme.primary
     val typedColor = normalizeHex(typed)
     val (hint, warn) = when {
@@ -1021,10 +1069,42 @@ private fun SettingsScreen(
             TextButton(onClick = { store.resetAccent() }) { Text("Back to the default teal") }
 
             HorizontalDivider(color = Line, modifier = Modifier.padding(vertical = 4.dp))
+            Text("Audio quality", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text("Format", style = MaterialTheme.typography.bodyMedium)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                for ((key, label) in listOf("auto" to "Automatic", "opus" to "Opus", "aac" to "AAC")) {
+                    FilterChip(
+                        selected = audioFormat == key,
+                        onClick = {
+                            audioFormat = key
+                            Offline.setAudio(context, audioFormat, audioQuality)
+                        },
+                        label = { Text(label) },
+                    )
+                }
+            }
+            Text("Quality", style = MaterialTheme.typography.bodyMedium)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                for ((key, label) in listOf("best" to "Best", "medium" to "128 kbps", "small" to "64 kbps")) {
+                    FilterChip(
+                        selected = audioQuality == key,
+                        onClick = {
+                            audioQuality = key
+                            Offline.setAudio(context, audioFormat, audioQuality)
+                        },
+                        label = { Text(label) },
+                    )
+                }
+            }
+            Text("Songs saved from YouTube from now on use this; songs already saved keep theirs. " +
+                "Songs copied from your computer come in its format (set it there, where MP3 is " +
+                "also possible).", color = Smoke, style = MaterialTheme.typography.bodySmall)
+
+            HorizontalDivider(color = Line, modifier = Modifier.padding(vertical = 4.dp))
             Text("Saving songs", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             SettingSwitch(
-                title = "Save songs for offline",
-                detail = "Every song in your library is kept on this phone.",
+                title = "Save every song automatically",
+                detail = "Otherwise only songs you save by hand (from a song's or a category's menu) are kept.",
                 checked = status.enabled,
                 onChange = onSaving,
             )
