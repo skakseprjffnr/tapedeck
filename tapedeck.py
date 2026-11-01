@@ -18,16 +18,19 @@ Log:     ~/.local/state/tapedeck/tapedeck.log
 from __future__ import annotations
 
 import base64
+import collections
 import contextlib
 import glob
 import heapq
 import html
+import ipaddress
 import itertools
 import json
 import logging
 import os
 import random
 import re
+import secrets
 import shutil
 import sys
 import tempfile
@@ -49,7 +52,8 @@ from PySide6.QtGui import (
     QPainter, QPainterPath, QPalette, QPen, QPixmap, QShortcut, QTextOption,
 )
 from PySide6.QtNetwork import (
-    QLocalSocket, QNetworkAccessManager, QNetworkReply, QNetworkRequest,
+    QAbstractSocket, QHostAddress, QLocalSocket, QNetworkAccessManager, QNetworkInterface,
+    QNetworkReply, QNetworkRequest, QTcpServer,
 )
 from PySide6.QtWidgets import (
     QAbstractButton, QApplication, QFrame, QGraphicsDropShadowEffect,
@@ -62,7 +66,7 @@ from PySide6.QtWidgets import (
 APP_NAME = "Tapedeck"
 APP_ID = "tapedeck"
 IS_WINDOWS = sys.platform == "win32"
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 # ── Design tokens ────────────────────────────────────────────────────────────
 # Strict black and white. The accent only marks actions and what is playing.
@@ -89,6 +93,7 @@ ROW_H_WIDE = 62       # rows on a category's own page
 SIDEBAR_W = 216
 ROW_GAP = 2
 MAX_VISIBLE_ROWS = 8     # longer categories scroll inside their card
+CARD_ROWS = 40           # a card previews this many; the category's page shows them all
 
 SANS = ["IBM Plex Sans", "Segoe UI", "Noto Sans", "Cantarell", "DejaVu Sans"]
 
@@ -509,6 +514,7 @@ class Library(QObject):
         self.path = path
         self.songs: dict[str, Song] = {}
         self.categories: list[Category] = []
+        self._write_timer: QTimer | None = None
         self._load()
 
     # Persistence
@@ -544,7 +550,26 @@ class Library(QObject):
             log.warning("Couldn't read %s (%s); moved it to %s", self.path, exc, backup)
             self.songs, self.categories = {}, []
 
-    def save(self) -> None:
+    def save(self, soon: bool = False) -> None:
+        """Write the library. soon=True batches frequent background updates into one write."""
+        if soon:
+            if self._write_timer is None:
+                self._write_timer = QTimer(self)
+                self._write_timer.setSingleShot(True)
+                self._write_timer.setInterval(1500)
+                self._write_timer.timeout.connect(self.save)
+            self._write_timer.start()
+            return
+        if self._write_timer is not None:
+            self._write_timer.stop()
+        self._write()
+
+    def flush(self) -> None:
+        """Write anything still waiting (on quit)."""
+        if self._write_timer is not None and self._write_timer.isActive():
+            self.save()
+
+    def _write(self) -> None:
         in_use = {sid for category in self.categories for sid in category.song_ids}
         dropped = [song for sid, song in self.songs.items() if sid not in in_use]
         self.songs = {sid: song for sid, song in self.songs.items() if sid in in_use}
@@ -820,7 +845,7 @@ class Library(QObject):
             if duration is not None and song.duration != duration:
                 song.duration, changed = duration, True
         if changed:
-            self.save()
+            self.save(soon=True)  # many arrive at once after an import
         for song in matches:
             self.songChanged.emit(song.id)
 
@@ -1168,12 +1193,12 @@ def looks_like_share_code(text: str) -> bool:
     return "".join(text.split())[:len(SHARE_PREFIX)].lower() == SHARE_PREFIX
 
 
-def read_share_code(text: str) -> ImportBatch | None:
-    """The category in a share code, or None if it's damaged or incomplete."""
+def _unpack_code(text: str, prefix: str):
+    """The JSON inside a code, or None if it's damaged, incomplete or suspiciously big."""
     compact = "".join(text.split())  # chat apps sometimes wrap long codes
-    if not looks_like_share_code(compact):
+    if compact[:len(prefix)].lower() != prefix:
         return None
-    body = compact[len(SHARE_PREFIX):]
+    body = compact[len(prefix):]
     if not body or not re.fullmatch(r"[A-Za-z0-9_-]+", body):
         return None
     try:
@@ -1182,15 +1207,21 @@ def read_share_code(text: str) -> ImportBatch | None:
         raw = inflater.decompress(packed, MAX_SHARE_BYTES)
         if inflater.unconsumed_tail:
             return None
-        data = json.loads(raw.decode("utf-8"))
+        return json.loads(raw.decode("utf-8"))
     except (ValueError, zlib.error, UnicodeDecodeError):
         return None
-    if not isinstance(data, dict) or not isinstance(data.get("s"), list):
-        return None
-    text_of = lambda value, limit: value.strip()[:limit] if isinstance(value, str) else ""
+
+
+def _text_of(value, limit: int) -> str:
+    return value.strip()[:limit] if isinstance(value, str) else ""
+
+
+def _shared_entries(items, full: bool) -> list[dict]:
+    """Songs from a code. Share codes carry renamed titles; library codes carry every
+    song's title and channel (full=True)."""
     entries: list[dict] = []
     seen: set[str] = set()
-    for item in data["s"]:
+    for item in items if isinstance(items, list) else []:
         if isinstance(item, str):
             item = [item]
         if not isinstance(item, list) or not item or not isinstance(item[0], str):
@@ -1201,16 +1232,83 @@ def read_share_code(text: str) -> ImportBatch | None:
         seen.add(video_id)
         seconds = item[1] if len(item) > 1 else 0
         valid = isinstance(seconds, int) and not isinstance(seconds, bool) and 0 < seconds < 360_000
-        entries.append({"video_id": video_id, "title": "", "channel": "",
-                        "duration": seconds if valid else None,
-                        "custom": text_of(item[2], 200) if len(item) > 2 else ""})
+        third = _text_of(item[2], 200) if len(item) > 2 else ""
+        entries.append({"video_id": video_id, "duration": seconds if valid else None,
+                        "title": third if full else "", "custom": "" if full else third,
+                        "channel": _text_of(item[3], 120) if full and len(item) > 3 else ""})
         if len(entries) >= MAX_SHARED_SONGS:
             break
-    share_id = data.get("i") if isinstance(data.get("i"), str) else ""
-    return ImportBatch(title=text_of(data.get("n"), 80) or "Shared playlist",
-                       channel="a Tapedeck share code", entries=entries, kind="code",
-                       subtitle=text_of(data.get("d"), 140),
-                       share_id=share_id if re.fullmatch(r"[0-9a-f]{12}", share_id or "") else "")
+    return entries
+
+
+def _share_id(value) -> str:
+    return value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{12}", value) else ""
+
+
+def read_share_code(text: str) -> ImportBatch | None:
+    """The category in a share code, or None if it's damaged or incomplete."""
+    data = _unpack_code(text, SHARE_PREFIX)
+    if not isinstance(data, dict) or not isinstance(data.get("s"), list):
+        return None
+    return ImportBatch(title=_text_of(data.get("n"), 80) or "Shared playlist",
+                       channel="a Tapedeck share code", entries=_shared_entries(data["s"], False),
+                       kind="code", subtitle=_text_of(data.get("d"), 140),
+                       share_id=_share_id(data.get("i")))
+
+
+# A library code is every category at once, for moving to the phone app or another computer:
+#   tapedeck:lib:1:<base64url of zlib(JSON)>
+# JSON: {"a": accent, "c": [{"i", "n", "d", "s": [[video id, seconds, title, channel], …]}, …]}
+LIBRARY_PREFIX = "tapedeck:lib:1:"
+MAX_SHARED_CATEGORIES = 500
+
+
+def make_library_code(library: Library) -> str:
+    categories = []
+    for category in library.categories:
+        songs = [[song.video_id, int(song.duration or 0), song.display_title, song.channel]
+                 for song in (library.song(sid) for sid in category.song_ids) if song is not None]
+        categories.append({"i": category.share_id, "n": category.title, "d": category.subtitle,
+                           "s": songs})
+    raw = json.dumps({"a": ACCENT, "c": categories}, separators=(",", ":"),
+                     ensure_ascii=False).encode("utf-8")
+    return LIBRARY_PREFIX + base64.urlsafe_b64encode(zlib.compress(raw, 9)).decode("ascii").rstrip("=")
+
+
+def looks_like_library_code(text: str) -> bool:
+    return "".join(text.split())[:len(LIBRARY_PREFIX)].lower() == LIBRARY_PREFIX
+
+
+def read_library_code(text: str) -> list[ImportBatch] | None:
+    data = _unpack_code(text, LIBRARY_PREFIX)
+    if not isinstance(data, dict) or not isinstance(data.get("c"), list):
+        return None
+    batches = []
+    for item in data["c"][:MAX_SHARED_CATEGORIES]:
+        if isinstance(item, dict):
+            batches.append(ImportBatch(title=_text_of(item.get("n"), 80) or "Imported playlist",
+                                       channel="a Tapedeck library",
+                                       entries=_shared_entries(item.get("s"), True), kind="library",
+                                       subtitle=_text_of(item.get("d"), 140),
+                                       share_id=_share_id(item.get("i"))))
+    return batches
+
+
+def music_url(video_id: str) -> str:
+    return f"https://music.youtube.com/watch?v={video_id}"
+
+
+def copy_text(ctx: Ctx, text: str, confirmation: str) -> None:
+    QApplication.clipboard().setText(text)
+    if ctx.window is not None:
+        ctx.window.notify(confirmation)
+
+
+def add_link_actions(menu: QMenu, ctx: Ctx, video_id: str) -> None:
+    menu.addAction("Copy YouTube link").triggered.connect(
+        lambda: copy_text(ctx, watch_url(video_id), "YouTube link copied"))
+    menu.addAction("Copy YouTube Music link").triggered.connect(
+        lambda: copy_text(ctx, music_url(video_id), "YouTube Music link copied"))
 
 
 def song_links(library: Library, category: Category) -> str:
@@ -1239,6 +1337,342 @@ def update_summary(added: int, removed: int, name: str) -> str:
     return f"Updated “{name}”: " + " and ".join(parts) + "."
 
 
+# ── QR codes ─────────────────────────────────────────────────────────────────
+# A small QR Code (Model 2) encoder: byte mode, error correction L or M, any
+# version 1 to 40. Tapedeck shows one so the phone app can scan its way to
+# the library; this way there's no extra library to install.
+
+_QR_ECC_PER_BLOCK = {  # error correction codewords per block, by version
+    "L": (-1, 7, 10, 15, 20, 26, 18, 20, 24, 30, 18, 20, 24, 26, 30, 22, 24, 28, 30, 28, 28,
+          28, 28, 30, 30, 26, 28, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30),
+    "M": (-1, 10, 16, 26, 18, 24, 16, 18, 22, 22, 26, 30, 22, 22, 24, 24, 28, 28, 26, 26, 26,
+          26, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28),
+}
+_QR_BLOCKS = {  # number of error correction blocks, by version
+    "L": (-1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 4, 4, 4, 4, 4, 6, 6, 6, 6, 7, 8,
+          8, 9, 9, 10, 12, 12, 12, 13, 14, 15, 16, 17, 18, 19, 19, 20, 21, 22, 24, 25),
+    "M": (-1, 1, 1, 1, 2, 2, 4, 4, 4, 5, 5, 5, 8, 9, 9, 10, 10, 11, 13, 14, 16,
+          17, 17, 18, 20, 21, 23, 25, 26, 28, 29, 31, 33, 35, 37, 38, 40, 43, 45, 47, 49),
+}
+_QR_FORMAT_BITS = {"L": 1, "M": 0}
+_QR_MASKS = (
+    lambda x, y: (x + y) % 2 == 0,
+    lambda x, y: y % 2 == 0,
+    lambda x, y: x % 3 == 0,
+    lambda x, y: (x + y) % 3 == 0,
+    lambda x, y: (x // 3 + y // 2) % 2 == 0,
+    lambda x, y: x * y % 2 + x * y % 3 == 0,
+    lambda x, y: (x * y % 2 + x * y % 3) % 2 == 0,
+    lambda x, y: ((x + y) % 2 + x * y % 3) % 2 == 0,
+)
+
+
+def _qr_raw_modules(version: int) -> int:
+    """Modules left for data and error correction once the fixed patterns are drawn."""
+    result = (16 * version + 128) * version + 64
+    if version >= 2:
+        aligns = version // 7 + 2
+        result -= (25 * aligns - 10) * aligns - 55
+        if version >= 7:
+            result -= 36
+    return result
+
+
+def _qr_data_codewords(version: int, level: str) -> int:
+    return _qr_raw_modules(version) // 8 - _QR_ECC_PER_BLOCK[level][version] * _QR_BLOCKS[level][version]
+
+
+def _gf_multiply(x: int, y: int) -> int:
+    z = 0
+    for i in reversed(range(8)):
+        z = (z << 1) ^ ((z >> 7) * 0x11D)
+        z ^= ((y >> i) & 1) * x
+    return z
+
+
+def _rs_divisor(degree: int) -> list[int]:
+    result = [0] * (degree - 1) + [1]
+    root = 1
+    for _ in range(degree):
+        for j in range(degree):
+            result[j] = _gf_multiply(result[j], root)
+            if j + 1 < degree:
+                result[j] ^= result[j + 1]
+        root = _gf_multiply(root, 0x02)
+    return result
+
+
+def _rs_remainder(data: list[int], divisor: list[int]) -> list[int]:
+    result = [0] * len(divisor)
+    for byte in data:
+        factor = byte ^ result.pop(0)
+        result.append(0)
+        for i, coefficient in enumerate(divisor):
+            result[i] ^= _gf_multiply(coefficient, factor)
+    return result
+
+
+def _qr_alignment_positions(version: int) -> list[int]:
+    if version == 1:
+        return []
+    count = version // 7 + 2
+    step = (version * 8 + count * 3 + 5) // (count * 4 - 4) * 2
+    size = version * 4 + 17
+    return [6] + [size - 7 - i * step for i in reversed(range(count - 1))]
+
+
+def _qr_codewords(data: bytes, version: int, level: str) -> list[int]:
+    """The data bit stream, padded, split into blocks and interleaved with error correction."""
+    capacity = _qr_data_codewords(version, level)
+    bits: list[int] = []
+
+    def put(value: int, length: int) -> None:
+        bits.extend((value >> i) & 1 for i in reversed(range(length)))
+
+    put(0b0100, 4)  # byte mode
+    put(len(data), 8 if version < 10 else 16)
+    for byte in data:
+        put(byte, 8)
+    put(0, min(4, capacity * 8 - len(bits)))
+    put(0, -len(bits) % 8)
+    words = [int("".join(map(str, bits[i:i + 8])), 2) for i in range(0, len(bits), 8)]
+    pad = 0xEC
+    while len(words) < capacity:
+        words.append(pad)
+        pad ^= 0xEC ^ 0x11
+    block_count = _QR_BLOCKS[level][version]
+    ecc_length = _QR_ECC_PER_BLOCK[level][version]
+    raw = _qr_raw_modules(version) // 8
+    short_blocks = block_count - raw % block_count
+    short_length = raw // block_count
+    divisor = _rs_divisor(ecc_length)
+    blocks, start = [], 0
+    for index in range(block_count):
+        length = short_length - ecc_length + (0 if index < short_blocks else 1)
+        chunk = words[start:start + length]
+        start += length
+        ecc = _rs_remainder(chunk, divisor)
+        if index < short_blocks:
+            chunk = chunk + [0]  # placeholder so every block has the same length
+        blocks.append(chunk + ecc)
+    result = []
+    for i in range(len(blocks[0])):
+        for j, block in enumerate(blocks):
+            if i != short_length - ecc_length or j >= short_blocks:  # skip placeholders
+                result.append(block[i])
+    return result
+
+
+def _qr_penalty(modules: list[list[bool]]) -> int:
+    """How hard a masked symbol is to read (lower is better), per the QR standard's rules."""
+    size = len(modules)
+    lines = ["".join("1" if cell else "0" for cell in row) for row in modules]
+    lines += ["".join(lines[y][x] for y in range(size)) for x in range(size)]
+    score = 0
+    for line in lines:
+        for _, run in itertools.groupby(line):
+            length = sum(1 for _ in run)
+            if length >= 5:
+                score += length - 2
+        padded = "0000" + line + "0000"
+        score += 40 * (padded.count("10111010000") + padded.count("00001011101"))
+    for y in range(size - 1):
+        top, bottom = modules[y], modules[y + 1]
+        for x in range(size - 1):
+            if top[x] == top[x + 1] == bottom[x] == bottom[x + 1]:
+                score += 3
+    dark = sum(row.count(True) for row in modules)
+    total = size * size
+    score += 10 * ((abs(dark * 20 - total * 10) + total - 1) // total - 1)
+    return score
+
+
+def qr_matrix(text: str, level: str = "M", max_version: int = 40,
+              mask: int | None = None) -> list[list[bool]]:
+    """Encode text (UTF-8) as a QR code; True is a dark module. Raises ValueError if it's too long.
+
+    The mask is normally chosen by the standard's penalty rules; tests can force one.
+    """
+    data = text.encode("utf-8")
+    for version in range(1, max_version + 1):
+        header = 4 + (8 if version < 10 else 16)
+        if header + len(data) * 8 <= _qr_data_codewords(version, level) * 8:
+            break
+    else:
+        raise ValueError("too much text for one QR code")
+    size = version * 4 + 17
+    modules = [[False] * size for _ in range(size)]
+    fixed = [[False] * size for _ in range(size)]
+
+    def set_fixed(x: int, y: int, dark: bool) -> None:
+        modules[y][x] = dark
+        fixed[y][x] = True
+
+    for i in range(size):  # timing patterns
+        set_fixed(6, i, i % 2 == 0)
+        set_fixed(i, 6, i % 2 == 0)
+    for cx, cy in ((3, 3), (size - 4, 3), (3, size - 4)):  # finder patterns and separators
+        for dy in range(-4, 5):
+            for dx in range(-4, 5):
+                x, y = cx + dx, cy + dy
+                if 0 <= x < size and 0 <= y < size:
+                    set_fixed(x, y, max(abs(dx), abs(dy)) not in (2, 4))
+    positions = _qr_alignment_positions(version)
+    last = len(positions) - 1
+    for i, ax in enumerate(positions):
+        for j, ay in enumerate(positions):
+            if (i, j) in ((0, 0), (0, last), (last, 0)):
+                continue  # those corners hold finder patterns
+            for dy in range(-2, 3):
+                for dx in range(-2, 3):
+                    set_fixed(ax + dx, ay + dy, max(abs(dx), abs(dy)) != 1)
+
+    def draw_format(mask: int) -> None:
+        value = _QR_FORMAT_BITS[level] << 3 | mask
+        remainder = value
+        for _ in range(10):
+            remainder = (remainder << 1) ^ ((remainder >> 9) * 0x537)
+        bits = (value << 10 | remainder) ^ 0x5412
+        bit = lambda i: (bits >> i) & 1 == 1
+        for i in range(6):
+            set_fixed(8, i, bit(i))
+        set_fixed(8, 7, bit(6))
+        set_fixed(8, 8, bit(7))
+        set_fixed(7, 8, bit(8))
+        for i in range(9, 15):
+            set_fixed(14 - i, 8, bit(i))
+        for i in range(8):
+            set_fixed(size - 1 - i, 8, bit(i))
+        for i in range(8, 15):
+            set_fixed(8, size - 15 + i, bit(i))
+        set_fixed(8, size - 8, True)  # the module that's always dark
+
+    draw_format(0)  # reserves the format areas; redrawn once the mask is chosen
+    if version >= 7:
+        remainder = version
+        for _ in range(12):
+            remainder = (remainder << 1) ^ ((remainder >> 11) * 0x1F25)
+        bits = version << 12 | remainder
+        for i in range(18):
+            dark = (bits >> i) & 1 == 1
+            a, b = size - 11 + i % 3, i // 3
+            set_fixed(a, b, dark)
+            set_fixed(b, a, dark)
+
+    codewords = _qr_codewords(data, version, level)
+    index = 0
+    for right in range(size - 1, 0, -2):  # zigzag through column pairs, skipping the timing column
+        if right <= 6:
+            right -= 1
+        upward = (right + 1) & 2 == 0
+        for vertical in range(size):
+            y = size - 1 - vertical if upward else vertical
+            for x in (right, right - 1):
+                if not fixed[y][x] and index < len(codewords) * 8:
+                    modules[y][x] = (codewords[index >> 3] >> (7 - (index & 7))) & 1 == 1
+                    index += 1
+
+    def apply_mask(mask: int) -> None:
+        rule = _QR_MASKS[mask]
+        for y in range(size):
+            row, fixed_row = modules[y], fixed[y]
+            for x in range(size):
+                if not fixed_row[x] and rule(x, y):
+                    row[x] = not row[x]
+
+    best, best_score = 0, None
+    for candidate in (range(8) if mask is None else [mask]):
+        apply_mask(candidate)
+        draw_format(candidate)
+        score = _qr_penalty(modules)
+        if best_score is None or score < best_score:
+            best, best_score = candidate, score
+        apply_mask(candidate)  # masking twice undoes it
+    apply_mask(best)
+    draw_format(best)
+    return modules
+
+
+# ── Copying to the phone ─────────────────────────────────────────────────────
+def lan_address() -> str:
+    """This computer's address on the home network, preferring Wi-Fi, then Ethernet."""
+    found: list[tuple[int, str]] = []
+    for interface in QNetworkInterface.allInterfaces():
+        flags = interface.flags()
+        if not (flags & QNetworkInterface.InterfaceFlag.IsUp) or \
+                not (flags & QNetworkInterface.InterfaceFlag.IsRunning) or \
+                flags & QNetworkInterface.InterfaceFlag.IsLoopBack:
+            continue
+        kind = interface.type()
+        rank = {QNetworkInterface.InterfaceType.Wifi: 0,
+                QNetworkInterface.InterfaceType.Ethernet: 1}.get(kind, 2)
+        if kind == QNetworkInterface.InterfaceType.Virtual:
+            continue
+        for entry in interface.addressEntries():
+            address = entry.ip()
+            if address.protocol() != QAbstractSocket.NetworkLayerProtocol.IPv4Protocol:
+                continue
+            text = address.toString()
+            try:
+                ip = ipaddress.ip_address(text)
+            except ValueError:
+                continue
+            if ip.is_private and not ip.is_link_local and not ip.is_loopback:
+                found.append((rank * 10 + (0 if text.startswith("192.168.") else 1), text))
+    return min(found)[1] if found else ""
+
+
+class PhoneTransfer(QObject):
+    """Hands the library code to the phone over Wi-Fi, but only while the prompt is open.
+
+    The address has a random one-time path, and nothing else is served.
+    """
+
+    sent = Signal()
+
+    def __init__(self, code: str, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.body = code.encode("utf-8")
+        self.token = secrets.token_urlsafe(12)
+        self.url = ""
+        self.server = QTcpServer(self)
+        self.server.newConnection.connect(self._accept)
+        address = lan_address()
+        if address and self.server.listen(QHostAddress(QHostAddress.SpecialAddress.AnyIPv4), 0):
+            self.url = f"http://{address}:{self.server.serverPort()}/t/{self.token}"
+            log.info("Library ready for the phone at %s", self.url.rsplit("/", 1)[0] + "/…")
+
+    def close(self) -> None:
+        self.server.close()
+
+    def _accept(self) -> None:
+        while self.server.hasPendingConnections():
+            socket = self.server.nextPendingConnection()
+            buffer = bytearray()
+            socket.readyRead.connect(lambda s=socket, b=buffer: self._read(s, b))
+            socket.disconnected.connect(socket.deleteLater)
+            timer = QTimer(socket)  # don't keep idle connections around
+            timer.setSingleShot(True)
+            timer.timeout.connect(socket.abort)
+            timer.start(15_000)
+
+    def _read(self, socket, buffer: bytearray) -> None:
+        buffer += bytes(socket.readAll())
+        if b"\r\n\r\n" not in buffer and len(buffer) < 8192:
+            return  # the request isn't complete yet
+        request = bytes(buffer).split(b"\r\n", 1)[0].decode("latin-1", "replace").split(" ")
+        wanted = len(request) >= 2 and request[0] in ("GET", "HEAD") and request[1] == f"/t/{self.token}"
+        body = self.body if wanted else b"Not found"
+        status = "200 OK" if wanted else "404 Not Found"
+        head = (f"HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                f"Content-Length: {len(body)}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")
+        socket.write(head.encode("ascii") + (body if request[0] != "HEAD" else b""))
+        socket.disconnectFromHost()
+        if wanted and request[0] == "GET":
+            log.info("Sent the library to the phone")
+            self.sent.emit()
+
+
 # ── Thumbnails ───────────────────────────────────────────────────────────────
 class ThumbCache(QObject):
     """YouTube thumbnails, cached on disk and in memory."""
@@ -1252,24 +1686,42 @@ class ThumbCache(QObject):
             self.folder.mkdir(parents=True, exist_ok=True)
         except OSError:
             pass  # thumbnails still work, just without the disk cache
-        self._memory: dict[str, QPixmap] = {}
+        # Recently used thumbnails, downscaled: about 130 KB each instead of 230 KB,
+        # and at most MEMORY_LIMIT of them (the rest reload from disk in a moment).
+        self._memory: collections.OrderedDict[str, QPixmap] = collections.OrderedDict()
         self._pending: set[str] = set()
-        self._failed: set[str] = set()
+        self._failed: dict[str, float] = {}  # video id → when to try again
         self._network = QNetworkAccessManager(self)
+
+    MEMORY_LIMIT = 240
+    RETRY_AFTER = 10 * 60
+    KEEP = QSize(240, 135)  # sharp enough for the largest thumbnail at high zoom
+
+    def _remember(self, video_id: str, pixmap: QPixmap) -> QPixmap:
+        if pixmap.width() > self.KEEP.width():
+            pixmap = pixmap.scaled(self.KEEP, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                   Qt.TransformationMode.SmoothTransformation)
+        self._memory[video_id] = pixmap
+        self._memory.move_to_end(video_id)
+        while len(self._memory) > self.MEMORY_LIMIT:
+            self._memory.popitem(last=False)
+        return pixmap
 
     def get(self, video_id: str) -> QPixmap | None:
         """Return the thumbnail now if we have it; otherwise fetch it and emit ready()."""
         if not video_id:
             return None
         if video_id in self._memory:
+            self._memory.move_to_end(video_id)
             return self._memory[video_id]
         path = self.folder / f"{video_id}.jpg"
         if path.exists():
             pixmap = QPixmap(str(path))
             if not pixmap.isNull():
-                self._memory[video_id] = pixmap
-                return pixmap
-        if video_id not in self._pending and video_id not in self._failed:
+                return self._remember(video_id, pixmap)
+        if time.monotonic() < self._failed.get(video_id, 0.0):
+            return None
+        if video_id not in self._pending:
             self._pending.add(video_id)
             # mqdefault is 16:9 with no letterboxing.
             url = QUrl(f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg")
@@ -1287,14 +1739,15 @@ class ThumbCache(QObject):
         reply.deleteLater()
         pixmap = QPixmap()
         if data and pixmap.loadFromData(data):
-            self._memory[video_id] = pixmap
+            self._failed.pop(video_id, None)
+            self._remember(video_id, pixmap)
             try:
                 (self.folder / f"{video_id}.jpg").write_bytes(data)
             except OSError:
                 pass
             self.ready.emit(video_id)
-        else:
-            self._failed.add(video_id)
+        else:  # offline, or no thumbnail: try again in a while rather than never
+            self._failed[video_id] = time.monotonic() + self.RETRY_AFTER
 
 
 # ── Settings ─────────────────────────────────────────────────────────────────
@@ -1534,6 +1987,10 @@ class AudioCache(QObject):
 
     def size_bytes(self) -> int:
         return sum(self._sizes.values())
+
+    def has(self, video_id: str) -> bool:
+        """Saved, as far as we know (no disk check; path_for checks before playing)."""
+        return video_id in self.files
 
     def busy(self) -> bool:
         return bool(self._active or self._queued)
@@ -2146,6 +2603,7 @@ class SongEngine(QObject):
         self._streams: dict[str, dict] = {}
         self._pending_stream: dict | None = None
         self._lines: deque[str] = deque(maxlen=60)
+        self._last_report: tuple[float, float] | None = None
         self._wait = QTimer(self)
         self._wait.setSingleShot(True)
         self._wait.timeout.connect(self._load_pending_stream)
@@ -2472,8 +2930,13 @@ class SongEngine(QObject):
         if name == "time-pos":
             if self.song is not None and self._stage == "playing":
                 self.position = float(value) if number else None
-                self.positionChanged.emit(self.position, self.duration)
-                self._look_ahead()
+                now = time.monotonic()
+                last = self._last_report
+                if self.position is None or last is None or now - last[0] >= 0.25 \
+                        or abs(self.position - last[1]) >= 1.0:  # a seek shows at once
+                    self._last_report = (now, self.position or 0.0)
+                    self.positionChanged.emit(self.position, self.duration)
+                    self._look_ahead()
         elif name == "duration":
             if self.song is not None and number and value > 0:
                 self.duration = float(value)
@@ -3332,6 +3795,13 @@ def draw_glyph(painter: QPainter, kind: str, center: QPointF, color: QColor,
             head.lineTo(0.0, -6.1)
             head.lineTo(3.1, -3.0)
             painter.drawPath(head)
+        elif kind == "phone":
+            painter.setPen(QPen(color, 1.6))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(QRectF(-4.6, -7.2, 9.2, 14.4), 2.2, 2.2)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            painter.drawEllipse(QPointF(0.0, 4.6), 1.1, 1.1)
         elif kind == "settings":
             ring = QPainterPath()
             ring.setFillRule(Qt.FillRule.OddEvenFill)
@@ -3598,6 +4068,9 @@ class VolumeSlider(QWidget):
         self.update()
 
     def wheelEvent(self, event) -> None:
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            event.ignore()  # Ctrl+scroll zooms the window instead
+            return
         steps = event.angleDelta().y() / 120
         if steps:
             self._change(self._value + int(round(steps * 5)))
@@ -4088,7 +4561,8 @@ class SongRow(QFrame):
                 QFontMetrics(self.pos_label.font()).horizontalAdvance("000") + z(24))
             self.pos_edit.committed.connect(self._position_committed)
             self.pos_edit.cancelled.connect(self._end_position_edit)
-        count = len(self.song_list.rows)
+        category = self.ctx.library.category(self.song_list.category_id)
+        count = len(category.song_ids) if category is not None else len(self.song_list.rows)
         self.pos_edit.setValidator(QIntValidator(1, max(1, count), self.pos_edit))
         self.pos_label.hide()
         self.pos_edit.begin(self.pos_label.text())
@@ -4133,6 +4607,7 @@ class SongRow(QFrame):
     def _context_menu(self, pos: QPoint) -> None:
         menu = QMenu(self)
         add = menu.addAction("Add to categories…")
+        add_link_actions(menu, self.ctx, self.video_id)
         menu.addSeparator()
         remove = menu.addAction("Remove from this category")
         chosen = menu.exec(self.mapToGlobal(pos))
@@ -4288,15 +4763,29 @@ def format_total(seconds: float) -> str:
     return f"{hours} h {minutes} min" if minutes else f"{hours} h"
 
 
+def runtime_text(songs: list[Song]) -> str:
+    """Total length, saying "at least" while some lengths are still being looked up."""
+    known = [song.duration for song in songs if song.duration]
+    seconds = sum(known)
+    if seconds < 60:
+        return ""
+    return ("at least " if len(known) < len(songs) else "") + format_total(seconds)
+
+
 def songs_summary(library: Library, category: Category) -> str:
     songs = [song for song in (library.song(sid) for sid in category.song_ids) if song]
-    text = f"{len(songs)} song" + ("" if len(songs) == 1 else "s")
-    seconds = sum(song.duration or 0 for song in songs)
-    return text + (f", {format_total(seconds)}" if seconds >= 60 else "")
+    runtime = runtime_text(songs)
+    return song_count(len(songs)) + (f", {runtime}" if runtime else "")
 
 
 def wire_song_list(song_list: SongList, library: Library, category_id: str) -> None:
-    song_list.reordered.connect(lambda ids: library.reorder(category_id, ids))
+    def reordered(ids: list) -> None:  # a card shows only the top songs; the rest keep their order
+        category = library.category(category_id)
+        if category is not None:
+            shown = set(ids)
+            library.reorder(category_id, list(ids) + [sid for sid in category.song_ids
+                                                      if sid not in shown])
+    song_list.reordered.connect(reordered)
     song_list.moveRequested.connect(lambda sid, pos: library.move_song(category_id, sid, pos))
     song_list.removeRequested.connect(lambda sid: library.remove_song(category_id, sid))
 
@@ -4330,8 +4819,10 @@ class CategoryCard(QFrame):
             lambda text: ctx.library.rename_category(self.category_id, title=text))
         self.subtitle.committed.connect(
             lambda text: ctx.library.rename_category(self.category_id, subtitle=text))
+        self.meta = plain_label(name="CardMeta", font=make_font(12, tabular=True))
         heading.addWidget(self.title)
         heading.addWidget(self.subtitle)
+        heading.addWidget(self.meta)
         top.addLayout(heading, 1)
         self.shuffle_button = GlyphButton("shuffle", variant="toggle")
         self.play_button = GlyphButton("play", variant="outline")
@@ -4352,6 +4843,14 @@ class CategoryCard(QFrame):
         self.scroller.setWidget(self.list)
         layout.addWidget(self.scroller)
 
+        self.see_all = QPushButton("")
+        self.see_all.setObjectName("Ghost")
+        self.see_all.setFont(make_font(12, QFont.Weight.Medium))
+        self.see_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.see_all.clicked.connect(
+            lambda: ctx.window.show_page(category_id) if ctx.window is not None else None)
+        self.see_all.hide()
+        layout.addWidget(self.see_all, 0, Qt.AlignmentFlag.AlignLeft)
         self.empty = plain_label("Empty. Use the + button to add a song.", "CardEmpty",
                                  make_font(13))
         self.empty.setContentsMargins(z(4), 0, 0, z(6))
@@ -4377,18 +4876,24 @@ class CategoryCard(QFrame):
         category = self.ctx.library.category(self.category_id)
         if category is None:
             return
-        self.list.sync(list(category.song_ids))
+        self.list.sync(category.song_ids[:CARD_ROWS])
         count = len(category.song_ids)
+        self.see_all.setVisible(count > CARD_ROWS)
+        self.see_all.setText(f"See all {count} songs")
         self.empty.setVisible(count == 0)
         self.scroller.setVisible(count > 0)
-        shown = min(count, MAX_VISIBLE_ROWS)
+        shown = min(count, MAX_VISIBLE_ROWS, CARD_ROWS)
         self.scroller.setFixedHeight(max(0, shown * z(ROW_H) + max(0, shown - 1) * z(ROW_GAP)))
+        self.meta.setText(songs_summary(self.ctx.library, category))
         self._update_controls()
 
     def song_changed(self, song_id: str) -> None:
         row = self.list.row_for(song_id)
         if row is not None:
             row.refresh()
+            category = self.ctx.library.category(self.category_id)
+            if category is not None:  # a length that just arrived changes the total
+                self.meta.setText(songs_summary(self.ctx.library, category))
 
     def thumb_ready(self, video_id: str) -> None:
         for row in self.list.rows:
@@ -4962,10 +5467,16 @@ class PlaylistSheet(Sheet):
         second = QVBoxLayout(self.step2)
         second.setContentsMargins(0, 0, 0, 0)
         second.setSpacing(z(10))
-        intro = plain_label("Its songs go to the top of each category you tick, in order.",
-                            "FieldHint", make_font(13))
-        intro.setWordWrap(True)
-        second.addWidget(intro)
+        self.intro = plain_label("Its songs go to the top of each category you tick, in order.",
+                                 "FieldHint", make_font(13))
+        self.intro.setWordWrap(True)
+        second.addWidget(self.intro)
+        self.library_note = plain_label(
+            "Categories you already have from this library are updated to match; the rest are "
+            "added as new categories.", "SheetText", make_font(13))
+        self.library_note.setWordWrap(True)
+        self.library_note.hide()
+        second.addWidget(self.library_note)
         self.update_check = CheckRow("", "Update", "Match the share code")
         self.update_check.hide()
         self.new_check = CheckRow("", "New category", "Named after the playlist")
@@ -5009,6 +5520,15 @@ class PlaylistSheet(Sheet):
     # What was pasted
     def _link_changed(self, text: str) -> None:
         stripped = text.strip()
+        if looks_like_library_code(stripped):
+            batches = read_library_code(stripped)
+            if batches is None:
+                self._problem(BROKEN_CODE_HINT, text)
+            elif not any(batch.entries for batch in batches):
+                self._problem("That library code has no songs in it.", text)
+            else:
+                self._use_library(batches, ("library", "".join(stripped.split())))
+            return
         if looks_like_share_code(stripped):
             batch = read_share_code(stripped)
             if batch is None:
@@ -5075,6 +5595,25 @@ class PlaylistSheet(Sheet):
         self._show_preview(batch.title, meta, batch.entries[0]["video_id"])
         self._validate()
 
+    def _use_library(self, batches: list[ImportBatch], key) -> None:
+        if key == self._key:
+            return
+        self.stop()
+        self._key, self.result, self.match = key, batches, None
+        library = self.ctx.library
+        known = sum(1 for batch in batches if batch.share_id and library.category_by_share(batch.share_id))
+        songs = sum(len(batch.entries) for batch in batches)
+        meta = f"{len(batches)} categor{'y' if len(batches) == 1 else 'ies'}, {song_count(songs)}"
+        if known:
+            meta += f"; {known} already here will be updated to match"
+        first = next(batch for batch in batches if batch.entries)
+        self._show_preview("A whole Tapedeck library", meta, first.entries[0]["video_id"])
+        self._validate()
+
+    @property
+    def is_library(self) -> bool:
+        return isinstance(self.result, list)
+
     def _job_done(self, job: PlaylistJob) -> None:
         if job is not self.job:
             return
@@ -5129,6 +5668,11 @@ class PlaylistSheet(Sheet):
         if self._step == 1:
             self.primary.setEnabled(self.result is not None)
             return
+        if self.is_library:
+            count = len(self.result)
+            self.primary.setEnabled(True)
+            self.primary.setText(f"Import {count} categor{'y' if count == 1 else 'ies'}")
+            return
         if updating:
             self.primary.setEnabled(True)
             self.primary.setText(f"Update “{self.match.title}”")
@@ -5148,7 +5692,11 @@ class PlaylistSheet(Sheet):
         self.title_label.setText("Import playlist" if step == 1 else "Choose categories")
         self.step_label.setText(f"{step} of 2")
         self.secondary.setText("Cancel" if step == 1 else "Back")
-        if step == 2:
+        library_mode = step == 2 and self.is_library
+        for widget in (self.new_check, self.name_input, self.picker, self.picker_label, self.intro):
+            widget.setVisible(not library_mode)
+        self.library_note.setVisible(library_mode)
+        if step == 2 and not library_mode:
             match = self.match
             self.update_check.setVisible(match is not None)
             if match is not None:
@@ -5167,6 +5715,9 @@ class PlaylistSheet(Sheet):
             return
         if self._step == 1:
             self._show_step(2)
+            return
+        if self.is_library:
+            self.submitted.emit(self.result, "", [], "")
             return
         if self.updating:
             self.submitted.emit(self.result, "", [], self.match.id)
@@ -5231,7 +5782,7 @@ ACCENT_HINT = "Type a hex code like #4592a2, or pick a color."
 
 def saved_counts(ctx: Ctx) -> tuple[int, int]:
     videos = {song.video_id for song in ctx.library.songs.values()}
-    return sum(1 for video_id in videos if ctx.cache.path_for(video_id) is not None), len(videos)
+    return sum(1 for video_id in videos if ctx.cache.has(video_id)), len(videos)
 
 
 class Swatch(QAbstractButton):
@@ -5464,6 +6015,98 @@ def membership_summary(library: Library, added: list[str], removed: list[str]) -
     if removed:
         parts.append(f"{'removed' if added else 'Removed'} from {join_names(library, removed)}")
     return ", and ".join(parts) + "."
+
+
+class QrView(QWidget):
+    """A QR code: dark modules on white, inside the quiet zone scanners need."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.matrix: list[list[bool]] = []
+        self.setFixedSize(z(200), z(200))
+
+    def set_text(self, text: str) -> None:
+        self.matrix = qr_matrix(text, "M") if text else []
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(WHITE))
+        painter.drawRoundedRect(QRectF(self.rect()), zf(14), zf(14))
+        if not self.matrix:
+            return
+        cells = len(self.matrix) + 8  # four light modules on every side
+        module = max(1, min(self.width(), self.height()) // cells)
+        left = (self.width() - module * cells) // 2 + 4 * module
+        top = (self.height() - module * cells) // 2 + 4 * module
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)  # crisp squares
+        painter.setBrush(QColor(BLACK))
+        for y, row in enumerate(self.matrix):
+            for x, dark in enumerate(row):
+                if dark:
+                    painter.drawRect(left + x * module, top + y * module, module, module)
+
+
+class PhoneSheet(Sheet):
+    """Copy every category to the Android app: scan the QR code, or paste a code."""
+
+    copied = Signal(str)
+
+    def __init__(self, ctx: Ctx) -> None:
+        super().__init__("Copy to your phone", primary="Done", secondary="Copy code")
+        library = ctx.library
+        for category in library.categories:  # so sending again later updates the phone's copies
+            library.ensure_share_id(category.id)
+        self.code = make_library_code(library)
+        self.transfer = PhoneTransfer(self.code, self)
+        self.transfer.sent.connect(self._sent)
+        songs = sum(len(category.song_ids) for category in library.categories)
+        count = len(library.categories)
+        row = QHBoxLayout()
+        row.setSpacing(z(18))
+        self.qr = QrView()
+        row.addWidget(self.qr, 0, Qt.AlignmentFlag.AlignTop)
+        steps = QVBoxLayout()
+        steps.setSpacing(z(10))
+        for text in ("1. Install Tapedeck on your Android phone (the APK in your GitHub release).",
+                     "2. Open it, tap Import, then Scan QR code.",
+                     f"Your {count} categor{'y' if count == 1 else 'ies'} and {song_count(songs)} "
+                     "are copied. Categories the phone already has from this computer are "
+                     "updated to match."):
+            label = plain_label(text, "SheetText", make_font(13))
+            label.setWordWrap(True)
+            steps.addWidget(label)
+        steps.addStretch(1)
+        row.addLayout(steps, 1)
+        self.body.addLayout(row)
+        self.status = plain_label("", "FieldHint", make_font(12))
+        self.status.setWordWrap(True)
+        self.body.addWidget(self.status)
+        if self.transfer.url:
+            self.qr.set_text(self.transfer.url)
+            self.status.setText("Your phone needs to be on the same Wi-Fi as this computer. If "
+                                "your computer asks whether Tapedeck may use the network, allow "
+                                "it. Otherwise, use Copy code and paste it into the app.")
+        else:
+            self.qr.hide()
+            self.status.setText("This computer isn't on a network your phone can reach. Use Copy "
+                                "code, send it to your phone, and paste it into the app's Import.")
+
+    def _sent(self) -> None:
+        self.status.setText("Sent. The library is on your phone now.")
+        set_flag(self.status, "error", False)
+
+    def stop(self) -> None:
+        self.transfer.close()
+
+    def on_primary(self) -> None:
+        self.cancelled.emit()
+
+    def on_secondary(self) -> None:
+        QApplication.clipboard().setText(self.code)
+        self.copied.emit("Library code copied. Paste it into Import in the phone app.")
 
 
 class ConfirmSheet(Sheet):
@@ -5767,7 +6410,7 @@ class SavedStatus(QAbstractButton):
 
     def counts(self) -> tuple[int, int]:
         videos = {song.video_id for song in self.ctx.library.songs.values()}
-        saved = sum(1 for video_id in videos if self.ctx.cache.path_for(video_id) is not None)
+        saved = sum(1 for video_id in videos if self.ctx.cache.has(video_id))
         return saved, len(videos)
 
     def refresh(self) -> None:
@@ -5854,6 +6497,11 @@ class SideBar(QFrame):
         top.addWidget(plain_label("tapedeck", "Wordmark",
                                   make_font(22, QFont.Weight.Bold, tracking=-0.6)))
         top.addStretch(1)
+        self.phone_button = GlyphButton("phone", size=30, radius=9, variant="bare")
+        self.phone_button.setToolTip("Copy to your phone")
+        self.phone_button.clicked.connect(
+            lambda: ctx.window.open_phone() if ctx.window is not None else None)
+        top.addWidget(self.phone_button)
         self.settings_button = GlyphButton("settings", size=30, radius=9, variant="bare")
         self.settings_button.setToolTip("Settings  (Ctrl+,)")
         self.settings_button.clicked.connect(
@@ -6173,6 +6821,7 @@ class TransportBar(QFrame):
         menu = QMenu(self)
         add = menu.addAction("Add to categories…")
         show = menu.addAction("Show in its category")
+        add_link_actions(menu, self.ctx, song.video_id)
         chosen = menu.exec(self.info.mapToGlobal(pos))
         if chosen == add:
             window.open_song_categories(song.id)
@@ -6182,16 +6831,29 @@ class TransportBar(QFrame):
 
 class Root(QWidget):
     resized = Signal()
+    zoomed = Signal(int)  # Ctrl+scroll anywhere that isn't a scroll area (notches)
 
     def __init__(self) -> None:
         super().__init__()
         self.setObjectName("Root")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self._wheel = 0  # trackpads scroll in small steps; zoom once per full notch
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self.resized.emit()
+
+    def wheelEvent(self, event) -> None:
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self._wheel += event.angleDelta().y()
+            notches = int(self._wheel / 120)
+            if notches:
+                self._wheel -= notches * 120
+                self.zoomed.emit(notches)
+            event.accept()
+        else:
+            super().wheelEvent(event)
 
 
 class MainWindow(QMainWindow):
@@ -6212,6 +6874,10 @@ class MainWindow(QMainWindow):
         self._status_timer.setSingleShot(True)
         self._status_timer.setInterval(250)
         self._status_timer.timeout.connect(self._refresh_saved_status)
+        self._meta_timer = QTimer(self)  # song details arrive in bursts; total once per burst
+        self._meta_timer.setSingleShot(True)
+        self._meta_timer.setInterval(200)
+        self._meta_timer.timeout.connect(self._update_home_meta)
         self._zoom_timer = QTimer(self)  # several notches in a row rebuild once
         self._zoom_timer.setSingleShot(True)
         self._zoom_timer.setInterval(90)
@@ -6241,9 +6907,6 @@ class MainWindow(QMainWindow):
                              ("Ctrl+,", self.open_settings)):
             shortcut = QShortcut(QKeySequence(keys), self)
             shortcut.activated.connect(action)
-        app = QApplication.instance()
-        if app is not None:
-            app.installEventFilter(self)  # Ctrl+scroll zooms wherever the pointer is
 
         self._build()
         self._fetch_missing_details()
@@ -6305,8 +6968,17 @@ class MainWindow(QMainWindow):
         self.fab.clicked.connect(self.toggle_menu)
         self.toast = Toast(self.root)
         self.root.resized.connect(self._place_floating)
+        self.root.zoomed.connect(self.zoom_by)
+        self.stack.installEventFilter(self)
         self.setCentralWidget(self.root)  # the previous widgets, if any, are deleted
         self.rebuild()
+        self.watch_wheel(self.root)
+
+    def watch_wheel(self, widget: QWidget) -> None:
+        """Ctrl+scroll over a scroll area zooms instead of scrolling it."""
+        areas = widget.findChildren(QScrollArea)
+        for area in areas if isinstance(areas, list) else []:
+            area.viewport().installEventFilter(self)
 
     # Zoom
     def zoom_by(self, notches: int) -> None:
@@ -6405,6 +7077,7 @@ class MainWindow(QMainWindow):
             if card is None:
                 card = CategoryCard(self.ctx, category.id)
                 self.cards[category.id] = card
+                self.watch_wheel(card)
             self.grid.addWidget(card, index // 2, index % 2)
         for category_id in list(self.pages):
             if category_id not in alive:
@@ -6428,6 +7101,7 @@ class MainWindow(QMainWindow):
             page = CategoryPage(self.ctx, key)
             self.pages[key] = page
             self.stack.addWidget(page)
+            self.watch_wheel(page)
         self.stack.setCurrentWidget(self.pages[key] if key else self.page)
         self.current_page = key
         self.sidebar.set_current(key)
@@ -6440,9 +7114,10 @@ class MainWindow(QMainWindow):
 
     def _update_home_meta(self) -> None:
         categories = len(self.ctx.library.categories)
-        songs = len(self.ctx.library.songs)
+        songs = list(self.ctx.library.songs.values())
+        runtime = runtime_text(songs)
         self.home_meta.setText(f"{categories} categor{'y' if categories == 1 else 'ies'}, "
-                               f"{songs} song{'' if songs == 1 else 's'}")
+                               f"{song_count(len(songs))}" + (f", {runtime}" if runtime else ""))
 
     # Library and service updates
     def _category_songs_changed(self, category_id: str) -> None:
@@ -6459,6 +7134,7 @@ class MainWindow(QMainWindow):
     def _song_changed(self, song_id: str) -> None:
         for view in (*self.cards.values(), *self.pages.values()):
             view.song_changed(song_id)
+        self._meta_timer.start()  # a length that arrived changes the overall total
         if song_id == self.ctx.player.current:
             self.transport.refresh()
 
@@ -6513,6 +7189,10 @@ class MainWindow(QMainWindow):
             later(0, page.title.begin)
 
     def _notice(self, text: str) -> None:
+        self.toast.show_message(text)
+
+    def notify(self, text: str) -> None:
+        """A short message at the bottom of the window."""
         self.toast.show_message(text)
 
     def _player_state(self) -> None:
@@ -6630,6 +7310,15 @@ class MainWindow(QMainWindow):
         log.info("Accent color %s", ACCENT)
         self.toast.show_message("Accent color updated")
 
+    def open_phone(self) -> None:
+        if not self.ctx.library.categories:
+            self.notify("Add a category first")
+            return
+        sheet = PhoneSheet(self.ctx)
+        overlay = self._open_sheet(sheet)
+        overlay.dismissed.connect(sheet.stop)
+        sheet.copied.connect(self.notify)
+
     def open_share(self, category_id: str) -> None:
         category = self.ctx.library.category(category_id)
         if category is None or not category.song_ids:
@@ -6668,6 +7357,26 @@ class MainWindow(QMainWindow):
 
         def import_songs(source, new_title: str, category_ids: list, update_id: str) -> None:
             library = self.ctx.library
+            if isinstance(source, list):  # a whole library
+                added = updated = 0
+                for batch in source:
+                    match = library.category_by_share(batch.share_id) if batch.share_id else None
+                    if match is not None:
+                        library.replace_category_songs(match.id, batch.entries, title=batch.title,
+                                                       subtitle=batch.subtitle)
+                        updated += 1
+                    else:
+                        created = library.add_category(batch.title, batch.subtitle)
+                        created.share_id = batch.share_id
+                        library.import_songs(batch.entries, [created.id])
+                        added += 1
+                overlay.dismiss()
+                parts = ([f"added {added} categor{'y' if added == 1 else 'ies'}"] if added else []) + \
+                        ([f"updated {updated}"] if updated else [])
+                self.toast.show_message("Library imported: " + " and ".join(parts) + ".")
+                for batch in source:
+                    self._fill_in(batch.entries)
+                return
             if update_id:  # a newer share code of a playlist we already have
                 category = library.category(update_id)
                 added, removed = library.replace_category_songs(
@@ -6745,6 +7454,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self.ctx.player.shutdown()
+        self.ctx.library.flush()
         super().closeEvent(event)
 
 
@@ -6778,6 +7488,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{ background: 
 #Card {{ background: {BLACK}; border: 1px solid {HAIRLINE}; border-radius: 14px; }}
 #CardTitle {{ color: {WHITE}; }}
 #CardSubtitle {{ color: {SMOKE}; }}
+#CardMeta {{ color: {ASH}; }}
 #CardEmpty {{ color: {ASH}; }}
 
 #SongRow {{ background: transparent; border: 1px solid transparent; border-radius: 8px; }}
@@ -7007,6 +7718,7 @@ def main() -> int:
     window = MainWindow(ctx)
     ctx.window = window
     app.aboutToQuit.connect(ctx.player.shutdown)  # never leave mpv playing on its own
+    app.aboutToQuit.connect(ctx.library.flush)
 
     # Ctrl+C in a terminal closes the window properly (and stops playback).
     for signum in (signal.SIGINT, signal.SIGTERM):

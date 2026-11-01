@@ -1,0 +1,69 @@
+# Builds the Android app (an APK) on GitHub's Linux machines.
+#   Actions tab → "Android build" → Run workflow: download the APK under "Artifacts".
+#   Pushing a tag like v0.7.0 also attaches it to that release.
+# For each new APK to install over the last one, they must all be signed with the same key,
+# kept in the ANDROID_KEYSTORE and ANDROID_KEYSTORE_PASSWORD secrets (see the README).
+name: Android build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write  # lets tag builds attach the APK to their release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+
+      - name: Version and signing key
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then version="${GITHUB_REF_NAME#v}"; else version="0.0.1-dev"; fi
+          IFS=. read -r major minor patch <<< "${version%%-*}"
+          code=$(( ${major:-0} * 10000 + ${minor:-0} * 100 + ${patch:-0} ))
+          echo "TAPEDECK_VERSION=$version" >> "$GITHUB_ENV"
+          echo "TAPEDECK_VERSION_CODE=$(( code > 0 ? code : 1 ))" >> "$GITHUB_ENV"
+          if [ -n "$KEYSTORE" ]; then
+            echo "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/tapedeck.keystore"
+            echo "TAPEDECK_KEYSTORE=$RUNNER_TEMP/tapedeck.keystore" >> "$GITHUB_ENV"
+          else
+            echo "::warning::No ANDROID_KEYSTORE secret, so this APK is signed with a throwaway key. It installs, but the next version won't install over it without uninstalling first (which deletes the phone's library)."
+          fi
+
+      - name: Build the APK
+        env:
+          TAPEDECK_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          gradle --no-daemon assembleRelease
+          mkdir -p out
+          cp app/build/outputs/apk/release/app-release.apk "out/Tapedeck-${TAPEDECK_VERSION}-android.apk"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: Tapedeck-android
+          path: android/out/*.apk
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash ../.github/scripts/attach-to-release.sh out/*.apk

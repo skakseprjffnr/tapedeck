@@ -1,6 +1,17 @@
 __pycache__/
-build/
-windows/out/
+# makepkg and PyInstaller leftovers (top level only: android/app/src must stay in git)
+/src/
+/pkg/
+/build/
 *.pkg.tar.zst
-src/
-pkg/
+windows/out/
+windows/build/
+# Android build output and the signing key (the key lives in GitHub secrets, never in git)
+android/.gradle/
+android/build/
+android/app/build/
+android/out/
+android/local.properties
+android/signing/
+*.keystore
+*.jks
