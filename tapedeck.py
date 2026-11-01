@@ -66,7 +66,7 @@ from PySide6.QtWidgets import (
 APP_NAME = "Tapedeck"
 APP_ID = "tapedeck"
 IS_WINDOWS = sys.platform == "win32"
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 
 # ── Design tokens ────────────────────────────────────────────────────────────
 # Strict black and white. The accent only marks actions and what is playing.
@@ -1622,19 +1622,52 @@ def lan_address() -> str:
     return min(found)[1] if found else ""
 
 
-class PhoneTransfer(QObject):
-    """Hands the library code to the phone over Wi-Fi, but only while the prompt is open.
+AUDIO_TYPES = {".webm": "audio/webm", ".weba": "audio/webm", ".m4a": "audio/mp4", ".mp4": "audio/mp4",
+               ".opus": "audio/ogg", ".ogg": "audio/ogg", ".mp3": "audio/mpeg"}
 
-    The address has a random one-time path, and nothing else is served.
+
+class _Connection:
+    """One request from the phone: the bytes read so far, then the file being sent."""
+
+    __slots__ = ("socket", "timer", "buffer", "answered", "handle", "left", "video_id", "to_end")
+
+    def __init__(self, socket, timer) -> None:
+        self.socket, self.timer = socket, timer
+        self.buffer = bytearray()
+        self.answered = False
+        self.handle = None
+        self.left = 0
+        self.video_id = ""
+        self.to_end = False
+
+
+class PhoneTransfer(QObject):
+    """Hands the library to the phone over Wi-Fi, but only while the prompt is open.
+
+    The phone fetches the library code, then sends the list of songs it still needs; the ones
+    saved on this computer are copied straight from here instead of coming from YouTube again.
+    Every address carries a random one-time token, and nothing else is served.
     """
 
-    sent = Signal()
+    sent = Signal()        # the phone has the library
+    progressed = Signal()  # a song finished sending, or the phone asked for songs
 
-    def __init__(self, code: str, parent: QObject | None = None) -> None:
+    CHUNK = 256 * 1024
+    MAX_LIST = 1024 * 1024  # the phone's list of songs it needs
+    IDLE_MS = 15_000
+
+    def __init__(self, code: str, songs: dict[str, Path] | None = None,
+                 parent: QObject | None = None) -> None:
         super().__init__(parent)
         self.body = code.encode("utf-8")
+        self.songs = dict(songs or {})  # video id → saved audio file
         self.token = secrets.token_urlsafe(12)
         self.url = ""
+        self.wanted: set[str] = set()  # songs the phone asked this computer for
+        self.done: set[str] = set()    # …and has received in full
+        self._sent_bytes = 0
+        self._samples: deque[tuple[float, int]] = deque(maxlen=400)
+        self._connections: dict = {}
         self.server = QTcpServer(self)
         self.server.newConnection.connect(self._accept)
         address = lan_address()
@@ -1642,35 +1675,175 @@ class PhoneTransfer(QObject):
             self.url = f"http://{address}:{self.server.serverPort()}/t/{self.token}"
             log.info("Library ready for the phone at %s", self.url.rsplit("/", 1)[0] + "/…")
 
+    @property
+    def speed(self) -> float:
+        """Bytes per second over the last three seconds; 0 when nothing is moving."""
+        now = time.monotonic()
+        recent = [(when, total) for when, total in self._samples if now - when <= 3.0]
+        if len(recent) < 2 or now - recent[-1][0] > 1.5:
+            return 0.0
+        (first_time, first_total), (last_time, last_total) = recent[0], recent[-1]
+        return (last_total - first_total) / max(last_time - first_time, 0.25)
+
     def close(self) -> None:
         self.server.close()
+        for connection in list(self._connections.values()):
+            connection.socket.abort()
 
     def _accept(self) -> None:
         while self.server.hasPendingConnections():
             socket = self.server.nextPendingConnection()
-            buffer = bytearray()
-            socket.readyRead.connect(lambda s=socket, b=buffer: self._read(s, b))
-            socket.disconnected.connect(socket.deleteLater)
-            timer = QTimer(socket)  # don't keep idle connections around
+            timer = QTimer(socket)  # drop connections that go quiet
             timer.setSingleShot(True)
+            timer.setInterval(self.IDLE_MS)
             timer.timeout.connect(socket.abort)
-            timer.start(15_000)
+            connection = _Connection(socket, timer)
+            self._connections[socket] = connection
+            socket.readyRead.connect(lambda c=connection: self._read(c))
+            socket.bytesWritten.connect(lambda _count, c=connection: self._pump(c))
+            socket.disconnected.connect(lambda c=connection: self._closed(c))
+            timer.start()
 
-    def _read(self, socket, buffer: bytearray) -> None:
-        buffer += bytes(socket.readAll())
-        if b"\r\n\r\n" not in buffer and len(buffer) < 8192:
+    def _read(self, connection: _Connection) -> None:
+        connection.timer.start()  # it's active
+        data = bytes(connection.socket.readAll())
+        if connection.answered:
+            return
+        connection.buffer += data
+        end = connection.buffer.find(b"\r\n\r\n")
+        if end < 0:
+            if len(connection.buffer) > 65536:
+                self._reply(connection, "431 Request Header Fields Too Large", b"")
             return  # the request isn't complete yet
-        request = bytes(buffer).split(b"\r\n", 1)[0].decode("latin-1", "replace").split(" ")
-        wanted = len(request) >= 2 and request[0] in ("GET", "HEAD") and request[1] == f"/t/{self.token}"
-        body = self.body if wanted else b"Not found"
-        status = "200 OK" if wanted else "404 Not Found"
+        lines = bytes(connection.buffer[:end]).decode("latin-1", "replace").split("\r\n")
+        request = lines[0].split(" ")
+        method = request[0]
+        path = request[1] if len(request) > 1 else ""
+        headers = {}
+        for line in lines[1:]:
+            name, _, value = line.partition(":")
+            headers[name.strip().lower()] = value.strip()
+        body = bytes(connection.buffer[end + 4:])
+        if method == "POST":
+            try:
+                length = int(headers.get("content-length", "0"))
+            except ValueError:
+                length = -1
+            if not 0 <= length <= self.MAX_LIST:
+                self._reply(connection, "413 Payload Too Large", b"")
+                return
+            if len(body) < length:
+                return  # wait for the rest of the list
+            body = body[:length]
+        connection.answered = True
+        self._route(connection, method, path, headers, body)
+
+    def _route(self, connection: _Connection, method: str, path: str, headers: dict, body: bytes) -> None:
+        token = self.token
+        if path == f"/t/{token}" and method in ("GET", "HEAD"):
+            self._reply(connection, "200 OK", self.body, head_only=method == "HEAD")
+            if method == "GET":
+                log.info("Sent the library to the phone")
+                self.sent.emit()
+        elif path == f"/s/{token}" and method == "POST":
+            asked = {line.strip() for line in body.decode("utf-8", "replace").splitlines()}
+            offer = sorted(video_id for video_id in asked if video_id in self.songs)
+            self.wanted.update(offer)
+            log.info("The phone asked for %d songs; %d are saved here", len(asked), len(offer))
+            self._reply(connection, "200 OK", "\n".join(offer).encode("ascii"))
+            self.progressed.emit()
+        elif path.startswith(f"/a/{token}/") and method in ("GET", "HEAD"):
+            video_id = path.rsplit("/", 1)[-1]
+            target = self.songs.get(video_id) if VIDEO_ID.fullmatch(video_id) else None
+            if target is None:
+                self._reply(connection, "404 Not Found", b"Not found")
+            else:
+                self._send_file(connection, video_id, target, method == "HEAD", headers.get("range", ""))
+        else:
+            self._reply(connection, "404 Not Found", b"Not found")
+
+    def _reply(self, connection: _Connection, status: str, body: bytes, head_only: bool = False,
+               extra: str = "") -> None:
+        connection.answered = True
         head = (f"HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\n"
-                f"Content-Length: {len(body)}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")
-        socket.write(head.encode("ascii") + (body if request[0] != "HEAD" else b""))
-        socket.disconnectFromHost()
-        if wanted and request[0] == "GET":
-            log.info("Sent the library to the phone")
-            self.sent.emit()
+                f"Content-Length: {len(body)}\r\n{extra}Cache-Control: no-store\r\n"
+                "Connection: close\r\n\r\n")
+        connection.socket.write(head.encode("ascii") + (b"" if head_only else body))
+        connection.socket.disconnectFromHost()
+
+    def _send_file(self, connection: _Connection, video_id: str, path: Path, head_only: bool,
+                   wanted_range: str) -> None:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            self._reply(connection, "404 Not Found", b"Not found")
+            return
+        start, end, status = 0, size - 1, "200 OK"
+        match = re.fullmatch(r"bytes=(\d*)-(\d*)", wanted_range.replace(" ", ""))
+        if match and (match.group(1) or match.group(2)):  # resuming partway through
+            if match.group(1):
+                start = int(match.group(1))
+                if match.group(2):
+                    end = min(int(match.group(2)), size - 1)
+            else:  # "the last N bytes"
+                start = max(0, size - int(match.group(2)))
+            if start > end:
+                self._reply(connection, "416 Range Not Satisfiable", b"",
+                            extra=f"Content-Range: bytes */{size}\r\n")
+                return
+            status = "206 Partial Content"
+        length = max(0, end - start + 1)
+        kind = AUDIO_TYPES.get(path.suffix.lower(), "application/octet-stream")
+        head = (f"HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {length}\r\n"
+                "Accept-Ranges: bytes\r\n"
+                + (f"Content-Range: bytes {start}-{end}/{size}\r\n" if status.startswith("206") else "")
+                + "Cache-Control: no-store\r\nConnection: close\r\n\r\n")
+        connection.socket.write(head.encode("ascii"))
+        if head_only or length == 0:
+            connection.socket.disconnectFromHost()
+            return
+        try:
+            handle = open(path, "rb")
+            handle.seek(start)
+        except OSError:
+            connection.socket.abort()
+            return
+        connection.handle, connection.left = handle, length
+        connection.video_id, connection.to_end = video_id, end == size - 1
+        self._pump(connection)
+
+    def _pump(self, connection: _Connection) -> None:
+        """Feed the file to the socket a chunk at a time, so a whole song never sits in memory."""
+        connection.timer.start()  # it's active
+        handle = connection.handle
+        if handle is None:
+            return
+        socket = connection.socket
+        complete = True
+        while connection.left > 0 and socket.bytesToWrite() < 2 * self.CHUNK:
+            data = handle.read(min(self.CHUNK, connection.left))
+            if not data:  # the file got shorter while sending; the phone will try again
+                connection.left, complete = 0, False
+                break
+            socket.write(data)
+            connection.left -= len(data)
+            self._sent_bytes += len(data)
+            self._samples.append((time.monotonic(), self._sent_bytes))
+        if connection.left > 0:
+            return
+        handle.close()
+        connection.handle = None
+        if complete and connection.to_end:
+            self.done.add(connection.video_id)
+            self.progressed.emit()
+        socket.disconnectFromHost()  # after everything queued has gone out
+
+    def _closed(self, connection: _Connection) -> None:
+        if connection.handle is not None:
+            connection.handle.close()
+            connection.handle = None
+        self._connections.pop(connection.socket, None)
+        connection.socket.deleteLater()
 
 
 # ── Thumbnails ───────────────────────────────────────────────────────────────
@@ -6060,8 +6233,17 @@ class PhoneSheet(Sheet):
         for category in library.categories:  # so sending again later updates the phone's copies
             library.ensure_share_id(category.id)
         self.code = make_library_code(library)
-        self.transfer = PhoneTransfer(self.code, self)
+        video_ids = {song.video_id for category in library.categories
+                     for song in (library.song(sid) for sid in category.song_ids) if song}
+        saved = {video_id: path for video_id in video_ids
+                 if (path := ctx.cache.path_for(video_id)) is not None}
+        self.transfer = PhoneTransfer(self.code, saved, self)
         self.transfer.sent.connect(self._sent)
+        self.transfer.progressed.connect(self._show_progress)
+        self._ticker = QTimer(self)  # the speed, once a second while songs are moving
+        self._ticker.setInterval(1000)
+        self._ticker.timeout.connect(self._show_progress)
+        self._library_sent = False
         songs = sum(len(category.song_ids) for category in library.categories)
         count = len(library.categories)
         row = QHBoxLayout()
@@ -6074,7 +6256,11 @@ class PhoneSheet(Sheet):
                      "2. Open it, tap Import, then Scan QR code.",
                      f"Your {count} categor{'y' if count == 1 else 'ies'} and {song_count(songs)} "
                      "are copied. Categories the phone already has from this computer are "
-                     "updated to match."):
+                     "updated to match.",
+                     (f"The {song_count(len(saved))} saved on this computer are copied straight "
+                      "from here, which is much faster; keep this open until that's done. "
+                      if saved else "") +
+                     "Your phone gets the rest from YouTube."):
             label = plain_label(text, "SheetText", make_font(13))
             label.setWordWrap(True)
             steps.addWidget(label)
@@ -6095,10 +6281,31 @@ class PhoneSheet(Sheet):
                                 "code, send it to your phone, and paste it into the app's Import.")
 
     def _sent(self) -> None:
-        self.status.setText("Sent. The library is on your phone now.")
+        self._library_sent = True
+        self._show_progress()
+
+    def _show_progress(self) -> None:
+        transfer = self.transfer
+        wanted, done = len(transfer.wanted), len(transfer.done & transfer.wanted)
+        if wanted and done >= wanted:
+            self._ticker.stop()
+            text = f"All {song_count(wanted)} sent. You can close this."
+        elif wanted:
+            if not self._ticker.isActive():
+                self._ticker.start()
+            speed = transfer.speed
+            rate = f", {speed / 1_048_576:.1f} MB/s" if speed > 0 else ""
+            text = (f"Sending songs to your phone: {done} of {wanted}{rate}. "
+                    "Keep this open until it's done.")
+        elif self._library_sent:
+            text = "Sent. The library is on your phone now."
+        else:
+            return
+        self.status.setText(text)
         set_flag(self.status, "error", False)
 
     def stop(self) -> None:
+        self._ticker.stop()
         self.transfer.close()
 
     def on_primary(self) -> None:

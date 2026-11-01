@@ -8,6 +8,7 @@ import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import androidx.annotation.OptIn
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.database.StandaloneDatabaseProvider
@@ -25,10 +26,15 @@ import androidx.media3.exoplayer.offline.DownloadService
 import androidx.media3.exoplayer.scheduler.Requirements
 import androidx.media3.exoplayer.scheduler.Scheduler
 import java.io.File
+import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 
 /** What the saving progress bar shows. */
 data class SaveStatus(
@@ -41,6 +47,8 @@ data class SaveStatus(
     val waitingForNetwork: Boolean = false,
     val enabled: Boolean = true,
     val active: Boolean = false,
+    val bytesPerSecond: Double = 0.0,
+    val fromComputer: Boolean = false,
 )
 
 /**
@@ -50,6 +58,9 @@ data class SaveStatus(
  * reads from it first, so a saved song never touches the network. Saving runs in a foreground
  * service with a progress notification, on Wi-Fi unless mobile data is allowed, and picks up
  * where it left off after the app or the phone restarts.
+ *
+ * While the computer's Copy to your phone window is open, songs saved there are copied
+ * straight from it over Wi-Fi; if it goes away, those songs come from YouTube instead.
  */
 @OptIn(UnstableApi::class)
 object Offline {
@@ -59,7 +70,28 @@ object Offline {
     private var cacheInstance: SimpleCache? = null
     private var managerInstance: DownloadManager? = null
     private var preferencesInstance: SharedPreferences? = null
+    private var appContext: Context? = null
     private var firstSync = true
+
+    /** The computer's transfer, while its window is open: where to ask, and what it has. */
+    private class Computer(val base: String, val token: String, val songs: Set<String>)
+
+    @Volatile
+    private var computer: Computer? = null
+
+    @Volatile
+    private var computerCheckedAt = 0L
+    private val fromComputer: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    private val computerFailed: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    private val quick = YouTube.http.newBuilder()
+        .connectTimeout(2, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.SECONDS)
+        .build()
+
+    // Download speed: bytes seen per download at the last sample, smoothed over a few seconds.
+    private val lastBytes = HashMap<String, Long>()
+    private var lastSampleAt = 0L
+    private var bytesPerSecond = 0.0
 
     @Volatile
     private var wanted: Set<String> = emptySet()
@@ -78,6 +110,7 @@ object Offline {
     fun cache(context: Context): SimpleCache {
         cacheInstance?.let { return it }
         val app = context.applicationContext
+        appContext = app
         val provider = database(app)
         val old = File(app.cacheDir, "audio")  // where 0.7.0 kept played songs
         if (old.exists()) runCatching { SimpleCache.delete(old, provider) }
@@ -92,8 +125,64 @@ object Offline {
         val uri = spec.uri
         val videoId = uri.getQueryParameter("v")
         if (uri.host != "www.youtube.com" || videoId == null) return spec
+        computerLink(videoId)?.let { return spec.withUri(Uri.parse(it)) }
         val url = YouTube.audioUrl(videoId)
         return spec.withUri(Uri.parse(url)).withAdditionalHeaders(YouTube.streamHeaders(url))
+    }
+
+    /**
+     * Tells the computer which of these songs the phone still needs, and remembers the ones it
+     * can send. [link] is the QR code's address. Network: call on a background thread.
+     * Returns how many songs will come from the computer.
+     */
+    fun offerComputer(link: String, songIds: Collection<String>): Int {
+        val uri = Uri.parse(link)
+        val segments = uri.pathSegments
+        if (segments.size != 2 || segments[0] != "t") return 0
+        val base = "${uri.scheme}://${uri.encodedAuthority}"
+        val token = segments[1]
+        val have = _saved.value
+        val need = songIds.filter { it !in have }.distinct()
+        if (need.isEmpty()) return 0
+        val request = okhttp3.Request.Builder()
+            .url("$base/s/$token")
+            .post(need.joinToString("\n").toRequestBody("text/plain".toMediaType()))
+            .build()
+        val offered = quick.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) return 0
+            response.body?.string().orEmpty().lines().map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+        }
+        if (offered.isEmpty()) return 0
+        computerFailed.clear()
+        computerCheckedAt = System.currentTimeMillis()
+        computer = Computer(base, token, offered)
+        return offered.size
+    }
+
+    /** The computer's address for a song, if it has it and its window is still open. */
+    private fun computerLink(videoId: String): String? {
+        val source = computer ?: return null
+        if (videoId !in source.songs || videoId in computerFailed) return null
+        val link = "${source.base}/a/${source.token}/$videoId"
+        if (System.currentTimeMillis() - computerCheckedAt > 10_000) {  // still there? a quick question
+            val reachable = try {
+                quick.newCall(okhttp3.Request.Builder().url(link).head().build()).execute().use { it.isSuccessful }
+            } catch (e: IOException) {
+                false
+            }
+            if (!reachable) {
+                computer = null
+                return null
+            }
+            computerCheckedAt = System.currentTimeMillis()
+        }
+        fromComputer.add(videoId)
+        return link
+    }
+
+    /** Starts saving after an import, from the computer where it can. Any thread. */
+    fun syncSoon(store: LibraryStore) {
+        main.post { appContext?.let { sync(it, store.categories.value, retryFailed = true) } }
     }
 
     @Synchronized
@@ -122,7 +211,17 @@ object Offline {
                 downloadManager: DownloadManager,
                 download: Download,
                 finalException: Exception?,
-            ) = refresh()
+            ) {
+                val id = download.request.id
+                if (download.state == Download.STATE_FAILED && fromComputer.remove(id)) {
+                    // The computer stopped sending (its window closed?): get this one from YouTube.
+                    computerFailed.add(id)
+                    send { DownloadService.sendAddDownload(app, SongDownloadService::class.java, request(id), false) }
+                } else if (download.state == Download.STATE_COMPLETED) {
+                    fromComputer.remove(id)
+                }
+                refresh()
+            }
 
             override fun onDownloadRemoved(downloadManager: DownloadManager, download: Download) = refresh()
 
@@ -185,6 +284,31 @@ object Offline {
         }
     }
 
+    /** About once a second while saving: measures the speed, then refreshes. Main thread. */
+    fun tick() {
+        val manager = managerInstance ?: return
+        val now = SystemClock.elapsedRealtime()
+        var received = 0L
+        val seen = HashSet<String>()
+        for (download in manager.currentDownloads) {
+            val id = download.request.id
+            seen.add(id)
+            val bytes = download.bytesDownloaded
+            val before = lastBytes[id]
+            if (before != null && bytes > before) received += bytes - before
+            lastBytes[id] = bytes
+        }
+        lastBytes.keys.retainAll(seen)
+        val elapsed = now - lastSampleAt
+        if (lastSampleAt > 0L && elapsed in 1L..10_000L) {
+            val instant = received * 1000.0 / elapsed
+            bytesPerSecond = if (bytesPerSecond == 0.0) instant else bytesPerSecond * 0.5 + instant * 0.5
+        }
+        lastSampleAt = now
+        if (seen.isEmpty()) bytesPerSecond = 0.0
+        refresh()
+    }
+
     /** Recomputes what the progress bar shows. Main thread (it reads live download progress). */
     fun refresh() {
         val manager = managerInstance ?: return
@@ -193,6 +317,8 @@ object Offline {
         val live = manager.currentDownloads.associateBy { it.request.id }
         val enabled = preferencesInstance?.getBoolean("save", true) ?: true
         val ids = wanted
+        val speed = if (live.isEmpty()) 0.0 else bytesPerSecond
+        val copying = computer != null && fromComputer.isNotEmpty()
         io.execute {
             val all = HashMap<String, Download>()
             runCatching {
@@ -230,6 +356,8 @@ object Offline {
                 waitingForNetwork = (notMet and Requirements.NETWORK) != 0,
                 enabled = enabled,
                 active = live.isNotEmpty(),
+                bytesPerSecond = speed,
+                fromComputer = copying,
             )
         }
     }

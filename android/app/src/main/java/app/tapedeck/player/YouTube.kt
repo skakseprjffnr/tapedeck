@@ -131,11 +131,26 @@ object Importer {
             throw IllegalStateException("Couldn't reach your computer. Check that your phone is on the same " +
                 "Wi-Fi and that Copy to your phone is still open there, then scan again.")
         }
+        // Before importing (which starts saving), find out which songs the computer can send,
+        // so those never start downloading from YouTube.
+        var fromComputer = 0
+        if (isLink) {
+            Codes.read(code)?.let { parsed ->
+                val songIds = parsed.categories.flatMap { category -> category.songs.map { it.videoId } }
+                fromComputer = try {
+                    Offline.offerComputer(text, songIds)
+                } catch (e: IOException) {
+                    0  // the songs come from YouTube instead
+                }
+            }
+        }
         val result = store.importCode(code)
         Tapedeck.fillInDetails(store)
+        Offline.syncSoon(store)
         val parts = ArrayList<String>()
         if (result.added > 0) parts.add("added ${result.added} ${if (result.added == 1) "category" else "categories"}")
         if (result.updated > 0) parts.add("updated ${result.updated}")
-        return "Imported: ${parts.joinToString(" and ")}."
+        val copying = if (fromComputer > 0) " Copying ${songCount(fromComputer)} from your computer." else ""
+        return "Imported: ${parts.joinToString(" and ")}.$copying"
     }
 }

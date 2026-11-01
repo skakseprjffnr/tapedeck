@@ -8,6 +8,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -27,12 +28,12 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.DownloadDone
 import androidx.compose.material.icons.filled.MoreVert
@@ -40,6 +41,7 @@ import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.RepeatOne
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Shuffle
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
@@ -51,6 +53,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -61,6 +64,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -83,6 +87,8 @@ import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -112,7 +118,21 @@ private sealed interface Screen {
     data object Library : Screen
     data class Open(val categoryId: String) : Screen
     data object Import : Screen
+    data object Settings : Screen
 }
+
+/** The computer's presets, in the same order. */
+private val PRESETS = listOf(
+    "#4592a2" to "Teal (default)", "#4f7cff" to "Blue", "#8b6cf6" to "Violet", "#e2609b" to "Pink",
+    "#e5534b" to "Red", "#ea8a3a" to "Orange", "#d4b43a" to "Gold", "#4fb36a" to "Green",
+)
+
+/** Contrast against the black background (WCAG), as the computer app measures it. */
+private fun contrastOnBlack(color: Color): Float = (color.luminance() + 0.05f) / 0.05f
+
+/** Black or white text on the accent, whichever reads better, like the computer app. */
+private fun onAccent(color: Color): Color =
+    if (contrastOnBlack(color) >= 1.05f / (color.luminance() + 0.05f)) Color.Black else Color.White
 
 private data class PlayerUi(
     val videoId: String? = null,
@@ -177,7 +197,7 @@ fun TapedeckApp(store: LibraryStore, controller: MediaController?) {
     val scheme = remember(accent) {
         darkColorScheme(
             primary = accent,
-            onPrimary = if (accent.luminance() > 0.4f) Color.Black else Color.White,
+            onPrimary = onAccent(accent),
             secondary = accent,
             background = Background,
             onBackground = Color.White,
@@ -205,10 +225,10 @@ fun TapedeckApp(store: LibraryStore, controller: MediaController?) {
         delay(400)  // a burst of changes syncs once
         Offline.sync(context, store.categories.value)
     }
-    LaunchedEffect(status.active) {  // live progress while songs are saving
+    LaunchedEffect(status.active) {  // live progress and speed while songs are saving
         while (status.active) {
             delay(1000)
-            Offline.refresh()
+            Offline.tick()
         }
     }
     // Android 13 and later ask before showing the saving notification; ask once.
@@ -237,12 +257,12 @@ fun TapedeckApp(store: LibraryStore, controller: MediaController?) {
                             onOpen = { screen = Screen.Open(it) },
                             onImport = { screen = Screen.Import },
                             onPlay = { category, shuffle -> playCategory(controller, category, null, shuffle) },
+                            onSettings = { screen = Screen.Settings },
                             onSaving = { on -> Offline.setSaving(context, on, store.categories.value) },
                             onMobileData = { allowed ->
                                 mobileData = allowed
                                 Offline.setMobileData(context, allowed)
                             },
-                            onDeleteSaved = { Offline.deleteSaved(context) },
                             onTryAgain = { Offline.sync(context, store.categories.value, retryFailed = true) },
                         )
                         is Screen.Open -> {
@@ -264,6 +284,21 @@ fun TapedeckApp(store: LibraryStore, controller: MediaController?) {
                         Screen.Import -> {
                             BackHandler { screen = Screen.Library }
                             ImportScreen(store = store, onDone = { screen = Screen.Library })
+                        }
+                        Screen.Settings -> {
+                            BackHandler { screen = Screen.Library }
+                            SettingsScreen(
+                                store = store,
+                                status = status,
+                                mobileData = mobileData,
+                                onBack = { screen = Screen.Library },
+                                onSaving = { on -> Offline.setSaving(context, on, store.categories.value) },
+                                onMobileData = { allowed ->
+                                    mobileData = allowed
+                                    Offline.setMobileData(context, allowed)
+                                },
+                                onDeleteSaved = { Offline.deleteSaved(context) },
+                            )
                         }
                     }
                 }
@@ -304,13 +339,11 @@ private fun LibraryScreen(
     onOpen: (String) -> Unit,
     onImport: () -> Unit,
     onPlay: (Category, Boolean) -> Unit,
+    onSettings: () -> Unit,
     onSaving: (Boolean) -> Unit,
     onMobileData: (Boolean) -> Unit,
-    onDeleteSaved: () -> Unit,
     onTryAgain: () -> Unit,
 ) {
-    var menu by remember { mutableStateOf(false) }
-    var confirmDelete by remember { mutableStateOf(false) }
     Scaffold(
         containerColor = Background,
         topBar = {
@@ -318,36 +351,7 @@ private fun LibraryScreen(
                 title = { Text("tapedeck", fontWeight = FontWeight.Bold) },
                 actions = {
                     IconButton(onClick = onImport) { Icon(Icons.Filled.Add, contentDescription = "Import") }
-                    Box {
-                        IconButton(onClick = { menu = true }) {
-                            Icon(Icons.Filled.MoreVert, contentDescription = "More")
-                        }
-                        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                            DropdownMenuItem(
-                                text = { Text("Save songs for offline") },
-                                trailingIcon = { if (status.enabled) Icon(Icons.Filled.Check, contentDescription = "On") },
-                                onClick = {
-                                    menu = false
-                                    onSaving(!status.enabled)
-                                },
-                            )
-                            DropdownMenuItem(
-                                text = { Text("Use mobile data for saving") },
-                                trailingIcon = { if (mobileData) Icon(Icons.Filled.Check, contentDescription = "On") },
-                                onClick = {
-                                    menu = false
-                                    onMobileData(!mobileData)
-                                },
-                            )
-                            DropdownMenuItem(
-                                text = { Text("Delete saved songs") },
-                                onClick = {
-                                    menu = false
-                                    confirmDelete = true
-                                },
-                            )
-                        }
-                    }
+                    IconButton(onClick = onSettings) { Icon(Icons.Filled.Settings, contentDescription = "Settings") }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = Background),
             )
@@ -395,26 +399,6 @@ private fun LibraryScreen(
             }
         }
     }
-    if (confirmDelete) {
-        AlertDialog(
-            onDismissRequest = { confirmDelete = false },
-            title = { Text("Delete saved songs?") },
-            text = {
-                Text("They'll stream from YouTube again, and saving stays off until you turn it " +
-                    "back on in this menu. Your library stays as it is.")
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    confirmDelete = false
-                    onDeleteSaved()
-                }) { Text("Delete", color = Danger) }
-            },
-            dismissButton = {
-                TextButton(onClick = { confirmDelete = false }) { Text("Cancel") }
-            },
-            containerColor = Raised,
-        )
-    }
 }
 
 /** How far along saving is: a progress bar until every song is on the phone. */
@@ -448,10 +432,12 @@ private fun SavingPanel(status: SaveStatus, onAllowMobileData: () -> Unit, onTur
                 color = accent,
                 trackColor = Line,
             )
+            val source = if (status.fromComputer) "from your computer" else "from YouTube"
             val detail = when {
                 !status.enabled -> "Saving is off."
                 status.waitingForNetwork -> "Waiting for an internet connection."
                 status.waitingForWifi -> "Waiting for Wi-Fi."
+                status.bytesPerSecond > 0 -> "Copying $source at ${formatSpeed(status.bytesPerSecond)}."
                 else -> "Saved songs play offline; the rest stream meanwhile."
             }
             Text("$detail ${formatBytes(status.bytes)} used.", color = Smoke, style = MaterialTheme.typography.bodySmall)
@@ -852,5 +838,170 @@ private fun ImportScreen(store: LibraryStore, onDone: () -> Unit) {
             if (busy) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
             problem?.let { Text(it, color = Danger) }
         }
+    }
+}
+
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SettingsScreen(
+    store: LibraryStore,
+    status: SaveStatus,
+    mobileData: Boolean,
+    onBack: () -> Unit,
+    onSaving: (Boolean) -> Unit,
+    onMobileData: (Boolean) -> Unit,
+    onDeleteSaved: () -> Unit,
+) {
+    val accentHex by store.accent.collectAsState()
+    val matchComputer by store.matchComputer.collectAsState()
+    var typed by remember { mutableStateOf(accentHex) }
+    LaunchedEffect(accentHex) {  // a preset or a reset updates the field
+        if (normalizeHex(typed) != accentHex) typed = accentHex
+    }
+    var confirmDelete by remember { mutableStateOf(false) }
+    val accent = MaterialTheme.colorScheme.primary
+    val typedColor = normalizeHex(typed)
+    val (hint, warn) = when {
+        typedColor == null -> "That isn't a hex color yet: six digits, like #4592a2." to true
+        contrastOnBlack(accentColor(typedColor)) < 3f ->
+            "That's hard to see on Tapedeck's black background. A lighter color works better." to true
+        else -> "Type a hex code like #4592a2, or pick a color." to false
+    }
+    Scaffold(
+        containerColor = Background,
+        topBar = {
+            TopAppBar(
+                title = { Text("Settings") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = Background),
+            )
+        },
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .padding(padding)
+                .imePadding()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text("Accent color", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            // A preview of what the color touches: buttons, progress, checks.
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(14.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(Panel)
+                    .padding(14.dp),
+            ) {
+                FilledIconButton(onClick = {}) { Icon(Icons.Filled.PlayArrow, contentDescription = null) }
+                Column(Modifier.weight(1f)) {
+                    Text("Now playing", color = accent, fontWeight = FontWeight.SemiBold)
+                    LinearProgressIndicator(
+                        progress = { 0.62f },
+                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp).height(4.dp),
+                        color = accent,
+                        trackColor = Line,
+                    )
+                }
+                Icon(Icons.Filled.DownloadDone, contentDescription = null, tint = accent)
+            }
+            for (row in PRESETS.chunked(4)) {  // two rows of four fit every phone
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    for ((hex, name) in row) {
+                        val selected = hex == accentHex
+                        Box(
+                            Modifier
+                                .size(40.dp)
+                                .clip(CircleShape)
+                                .background(accentColor(hex))
+                                .then(if (selected) Modifier.border(3.dp, Color.White, CircleShape) else Modifier)
+                                .clickable { store.setAccent(hex) }
+                                .semantics { contentDescription = name },
+                        )
+                    }
+                }
+            }
+            OutlinedTextField(
+                value = typed,
+                onValueChange = { value ->
+                    typed = value
+                    normalizeHex(value)?.let { store.setAccent(it) }
+                },
+                label = { Text("Hex color") },
+                placeholder = { Text(DEFAULT_ACCENT) },
+                singleLine = true,
+                isError = warn,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text(hint, color = if (warn) Danger else Smoke, style = MaterialTheme.typography.bodySmall)
+            SettingSwitch(
+                title = "Use my computer's color",
+                detail = "Copying your library brings its accent color along.",
+                checked = matchComputer,
+                onChange = { store.setMatchComputer(it) },
+            )
+            TextButton(onClick = { store.resetAccent() }) { Text("Back to the default teal") }
+
+            HorizontalDivider(color = Line, modifier = Modifier.padding(vertical = 4.dp))
+            Text("Saving songs", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            SettingSwitch(
+                title = "Save songs for offline",
+                detail = "Every song in your library is kept on this phone.",
+                checked = status.enabled,
+                onChange = onSaving,
+            )
+            SettingSwitch(
+                title = "Use mobile data for saving",
+                detail = "Otherwise it waits for Wi-Fi. Each song is about 3 to 5 MB.",
+                checked = mobileData,
+                onChange = onMobileData,
+            )
+            Text("${formatBytes(status.bytes)} used by saved songs.", color = Smoke,
+                style = MaterialTheme.typography.bodySmall)
+            OutlinedButton(onClick = { confirmDelete = true }) { Text("Delete saved songs", color = Danger) }
+            Spacer(Modifier.height(12.dp))
+        }
+    }
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text("Delete saved songs?") },
+            text = {
+                Text("They'll stream from YouTube again, and saving stays off until you turn it " +
+                    "back on. Your library stays as it is.")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmDelete = false
+                    onDeleteSaved()
+                }) { Text("Delete", color = Danger) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDelete = false }) { Text("Cancel") }
+            },
+            containerColor = Raised,
+        )
+    }
+}
+
+@Composable
+private fun SettingSwitch(title: String, detail: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.fillMaxWidth().clickable { onChange(!checked) }.padding(vertical = 4.dp),
+    ) {
+        Column(Modifier.weight(1f).padding(end = 12.dp)) {
+            Text(title)
+            Text(detail, color = Smoke, style = MaterialTheme.typography.bodySmall)
+        }
+        Switch(checked = checked, onCheckedChange = onChange)
     }
 }

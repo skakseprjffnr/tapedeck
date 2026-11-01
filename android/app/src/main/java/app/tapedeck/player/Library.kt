@@ -58,6 +58,19 @@ fun formatTotal(seconds: Int): String {
 
 fun songCount(count: Int): String = if (count == 1) "1 song" else "$count songs"
 
+/** "#4592a2" from "4592A2", "#4592a2" or "#49a"; null if it isn't a color. */
+fun normalizeHex(text: String): String? {
+    val digits = text.trim().removePrefix("#").lowercase()
+    if (!digits.all { it in '0'..'9' || it in 'a'..'f' }) return null
+    return when (digits.length) {
+        6 -> "#$digits"
+        3 -> "#" + digits.map { "$it$it" }.joinToString("")
+        else -> null
+    }
+}
+
+fun formatSpeed(bytesPerSecond: Double): String = "%.1f MB/s".format(bytesPerSecond / (1 shl 20))
+
 /** "12 songs, 47 min", saying "at least" while some lengths aren't known. */
 fun summary(songs: List<Song>): String {
     val known = songs.filter { it.seconds > 0 }
@@ -156,6 +169,11 @@ class LibraryStore(context: Context) {
     private val _accent = MutableStateFlow(DEFAULT_ACCENT)
     val accent: StateFlow<String> = _accent.asStateFlow()
 
+    /** On: importing from the computer brings its accent color along. Picking one here turns it off. */
+    private val _matchComputer = MutableStateFlow(true)
+    val matchComputer: StateFlow<Boolean> = _matchComputer.asStateFlow()
+    private var computerAccent: String? = null
+
     class ImportResult(val added: Int, val updated: Int)
 
     init {
@@ -188,10 +206,36 @@ class LibraryStore(context: Context) {
             list[index] = list[index].copy(title = incoming.title, subtitle = incoming.subtitle, songs = songs)
             updated += 1
         }
-        parsed.accent?.let { _accent.value = it }
+        parsed.accent?.let { color ->
+            computerAccent = color.lowercase()
+            if (_matchComputer.value) _accent.value = color.lowercase()
+        }
         _categories.value = list
         save()
         return ImportResult(added, updated)
+    }
+
+    /** Your own accent color, from Settings. */
+    @Synchronized
+    fun setAccent(hex: String) {
+        if (!Codes.COLOR.matches(hex)) return
+        _accent.value = hex.lowercase()
+        _matchComputer.value = false
+        save()
+    }
+
+    @Synchronized
+    fun setMatchComputer(on: Boolean) {
+        _matchComputer.value = on
+        if (on) computerAccent?.let { _accent.value = it }
+        save()
+    }
+
+    @Synchronized
+    fun resetAccent() {
+        _accent.value = DEFAULT_ACCENT
+        _matchComputer.value = false
+        save()
     }
 
     @Synchronized
@@ -231,6 +275,8 @@ class LibraryStore(context: Context) {
         try {
             val json = JSONObject(file.readText())
             json.optString("accent", "").takeIf { Codes.COLOR.matches(it) }?.let { _accent.value = it }
+            json.optString("computer_accent", "").takeIf { Codes.COLOR.matches(it) }?.let { computerAccent = it }
+            _matchComputer.value = json.optBoolean("match_computer", true)
             val list = json.optJSONArray("categories") ?: return
             val categories = ArrayList<Category>()
             for (index in 0 until list.length()) {
@@ -261,7 +307,9 @@ class LibraryStore(context: Context) {
             list.put(JSONObject().put("id", category.id).put("title", category.title)
                 .put("subtitle", category.subtitle).put("share_id", category.shareId).put("songs", songs))
         }
-        val text = JSONObject().put("version", 1).put("accent", _accent.value).put("categories", list).toString()
+        val text = JSONObject().put("version", 1).put("accent", _accent.value)
+            .put("computer_accent", computerAccent ?: "").put("match_computer", _matchComputer.value)
+            .put("categories", list).toString()
         val temp = File(file.parentFile, "library.json.tmp")
         temp.writeText(text)
         if (!temp.renameTo(file)) {  // write-then-rename, so a crash can't leave half a file

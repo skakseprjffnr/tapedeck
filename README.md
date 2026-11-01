@@ -90,6 +90,11 @@ title, length, and your accent color.
 
 - Your phone and computer need to be on the same Wi-Fi. If your computer asks
   whether Tapedeck may use the network, allow it (private networks are enough).
+- Songs already saved on this computer are copied straight to the phone over
+  Wi-Fi, which is much faster than YouTube. The window counts them and shows
+  the speed ("Sending songs to your phone: 37 of 85, 12.4 MB/s"); keep it open
+  until it says they're all sent. If you close it early, the phone gets the
+  rest from YouTube.
 - The QR code only works while that window is open, and it's a one-time
   address that serves nothing else.
 - On another network, click **Copy code** instead, send the code to your phone
@@ -138,10 +143,10 @@ open its **Actions** tab, choose **Windows build** and click **Run workflow**.
 After about ten minutes, download **Tapedeck-windows** from the run's
 Artifacts. It contains:
 
-- `Tapedeck-0.8.0-windows-setup.exe`, an installer that needs no admin rights
-- `Tapedeck-0.8.0-windows-portable.zip`, which runs from any folder
+- `Tapedeck-0.9.0-windows-setup.exe`, an installer that needs no admin rights
+- `Tapedeck-0.9.0-windows-portable.zip`, which runs from any folder
 
-Pushing a tag such as `v0.8.0` builds the same files (and the Android app) and
+Pushing a tag such as `v0.9.0` builds the same files (and the Android app) and
 attaches them to that release, which makes them easy to share.
 
 **On a Windows PC.** Install Python 3.11 or newer, plus Inno Setup 6 if you
@@ -177,21 +182,31 @@ isn't there yet: add them on your computer, then send the library again.
 
 ### Playing offline
 
-Copying the library sends the song list, not the audio. So right after an
-import, the phone starts saving every song from YouTube in the background.
-A progress bar at the top of the library (and a notification) shows how far
-along it is, for example "Saving songs for offline: 37 of 120". You can play
-songs meanwhile: saved ones, marked with a check, start instantly and work
-offline, and the rest stream.
+Right after an import, the phone saves every song in the background: the ones
+your computer has saved come straight from it over Wi-Fi (while its Copy to
+your phone window is open), and the rest from YouTube. A progress bar at the
+top of the library (and a notification) shows how far along it is, with the
+speed: "Saving songs for offline: 37 of 120", "Copying from your computer at
+18.3 MB/s". You can play songs meanwhile: saved ones, marked with a check,
+start instantly and work offline, and the rest stream.
 
-- Saving uses Wi-Fi only, unless you allow mobile data in the **⋮** menu (each
-  song is about 3 to 5 MB). Without Wi-Fi the bar says it's waiting.
+- Saving uses Wi-Fi only, unless you allow mobile data in Settings (each song
+  is about 3 to 5 MB). Without Wi-Fi the bar says it's waiting.
 - It keeps going with the screen off, and picks up where it left off if the
   app or the phone restarts.
 - Songs you remove, here or by sending an updated library, are deleted from
   the phone.
-- The **⋮** menu also turns saving off, or deletes every saved song to free
-  space.
+- Settings also turns saving off, or deletes every saved song to free space.
+
+### Settings
+
+Tap the **gear** at the top of the library:
+
+- **Accent color**, as on the computer: the same eight presets, or any hex code,
+  with a live preview and a warning if a color is hard to see on the black
+  background. **Use my computer's color** (on at first) brings the computer's
+  color along whenever you copy your library; picking a color here turns it off.
+- **Saving songs**: saving on or off, mobile data, and deleting saved songs.
 
 ### Installing it
 
