@@ -39,6 +39,22 @@ object YouTube {
         }
     }
 
+    /** YouTube plays this only for a signed-in, age-verified account; the phone can't sign in. */
+    class AgeRestricted : IOException(
+        "Age-restricted: YouTube plays it only for a signed-in account. It can come from your " +
+            "computer, signed in there.",
+    )
+
+    private val AGE_WORDS = Regex("age[- ]restrict|confirm your age|inappropriate for some users",
+        RegexOption.IGNORE_CASE)
+
+    /** Whether an error (or what caused it) is YouTube's age restriction. */
+    fun isAgeRestricted(error: Throwable?): Boolean =
+        generateSequence(error) { it.cause }.take(8).any { cause ->
+            cause is AgeRestricted || cause.javaClass.simpleName == "AgeRestrictedContentException" ||
+                cause.message?.let { AGE_WORDS.containsMatchIn(it) } == true
+        }
+
     /** YouTube no longer offers the format a partly saved copy began in, so it can't be finished. */
     class FormatGone(message: String) : IOException(message)
 
@@ -56,9 +72,9 @@ object YouTube {
         start()
         val info = try {
             StreamInfo.getInfo("https://www.youtube.com/watch?v=$videoId")
-        } catch (e: IOException) {
-            throw e
         } catch (e: Exception) {
+            if (isAgeRestricted(e)) throw AgeRestricted()
+            if (e is IOException) throw e
             throw IOException(e.message ?: "YouTube wouldn't play this song", e)
         }
         val streams = info.audioStreams.filter { it.deliveryMethod == DeliveryMethod.PROGRESSIVE_HTTP && it.isUrl }

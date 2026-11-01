@@ -104,6 +104,32 @@ title, length, and your accent color.
 - The same code also works in **+** → **Import Playlist** on another computer,
   for moving your whole library there.
 
+## Age-restricted songs
+
+YouTube plays age-restricted videos only for a signed-in account old enough to
+see them. Google blocks its sign-in page inside apps like this one, so Tapedeck
+uses the YouTube sign-in of a web browser instead:
+
+1. Sign in at youtube.com in your browser (Firefox is the most dependable).
+2. In Tapedeck, open Settings (the gear), choose the browser under **YouTube
+   account**, and click **Check** to make sure the sign-in is there.
+3. Click **Save**. Songs that failed because of their age restriction try again.
+
+Instead of a browser, you can use a cookies.txt file exported from one while
+signed in at youtube.com (close that browser window afterwards, or YouTube may
+replace the sign-in in it). Notes:
+
+- YouTube can limit accounts used by download tools, so a second Google account
+  is the safest one to sign in with.
+- On Windows, Chrome and Edge lock their sign-in away from other apps: use
+  Firefox, or a cookies.txt file.
+- On Linux, Chromium-based browsers need Python's secretstorage module:
+  `sudo pacman -S python-secretstorage`.
+
+The phone app can't sign in (its YouTube engine has no accounts), and it doesn't
+need to: age-restricted songs saved on your computer reach the phone through
+Copy to your phone, and then play from the phone's own copy, offline.
+
 ## Importing playlists
 
 Public and unlisted playlists work, including YouTube Music playlists and
@@ -143,10 +169,10 @@ open its **Actions** tab, choose **Windows build** and click **Run workflow**.
 After about ten minutes, download **Tapedeck-windows** from the run's
 Artifacts. It contains:
 
-- `Tapedeck-0.9.2-windows-setup.exe`, an installer that needs no admin rights
-- `Tapedeck-0.9.2-windows-portable.zip`, which runs from any folder
+- `Tapedeck-0.10.0-windows-setup.exe`, an installer that needs no admin rights
+- `Tapedeck-0.10.0-windows-portable.zip`, which runs from any folder
 
-Pushing a tag such as `v0.9.2` builds the same files (and the Android app) and
+Pushing a tag such as `v0.10.0` builds the same files (and the Android app) and
 attaches them to that release, which makes them easy to share.
 
 **On a Windows PC.** Install Python 3.11 or newer, plus Inno Setup 6 if you
@@ -210,7 +236,9 @@ start instantly and work offline, and the rest stream.
 
 ### Settings
 
-Tap the **gear** at the top of the library:
+Tap the **gear** at the top of the library (it also shows where saved songs are
+kept; they're in the player's own format, inside Tapedeck's private storage, so
+file managers can't open them):
 
 - **Accent color**, as on the computer: the same eight presets, or any hex code,
   with a live preview and a warning if a color is hard to see on the black
@@ -256,6 +284,8 @@ automatically, alongside the Windows files. To build it yourself, open the
   public repository, sharing the APK already meets the license's terms.
 
 ## Where things are kept (Linux)
+
+Settings has an **Open folder** button for the saved songs.
 
 - Library: `~/.local/share/tapedeck/library.json` (plain JSON, safe to back up)
 - Settings (volume, saving on/off): `~/.local/share/tapedeck/settings.json`

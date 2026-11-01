@@ -54,6 +54,7 @@ data class SaveStatus(
     val computerSpeed: Double = 0.0,
     val youtubeSpeed: Double = 0.0,
     val computerConnected: Boolean = false,
+    val ageRestricted: Int = 0,
 )
 
 /**
@@ -122,6 +123,21 @@ object Offline {
     val status: StateFlow<SaveStatus> = _status.asStateFlow()
     private val _saved = MutableStateFlow<Set<String>>(emptySet())
     val saved: StateFlow<Set<String>> = _saved.asStateFlow()
+
+    /** Songs YouTube plays only for a signed-in account: they can only come from the computer. */
+    private val _ageRestricted = MutableStateFlow<Set<String>>(emptySet())
+    val ageRestricted: StateFlow<Set<String>> = _ageRestricted.asStateFlow()
+
+    private fun markAgeRestricted(id: String, restricted: Boolean) {
+        val now = _ageRestricted.value
+        if ((id in now) == restricted) return
+        val next = if (restricted) now + id else now - id
+        _ageRestricted.value = next
+        preferencesInstance?.edit()?.putStringSet("age_restricted", HashSet(next))?.apply()
+    }
+
+    /** Where saved songs are kept: the app's own storage, which only Tapedeck can open. */
+    fun folderPath(context: Context): String = File(context.applicationContext.filesDir, "songs").absolutePath
 
     @Synchronized
     private fun database(context: Context): StandaloneDatabaseProvider =
@@ -289,8 +305,10 @@ object Offline {
 
     @Synchronized
     fun preferences(context: Context): SharedPreferences = preferencesInstance
-        ?: context.applicationContext.getSharedPreferences("offline", Context.MODE_PRIVATE)
-            .also { preferencesInstance = it }
+        ?: context.applicationContext.getSharedPreferences("offline", Context.MODE_PRIVATE).also {
+            preferencesInstance = it
+            _ageRestricted.value = it.getStringSet("age_restricted", emptySet())?.toSet() ?: emptySet()
+        }
 
     fun savingEnabled(context: Context): Boolean = preferences(context).getBoolean("save", true)
 
@@ -315,7 +333,12 @@ object Offline {
                 finalException: Exception?,
             ) {
                 val id = download.request.id
-                if (download.state == Download.STATE_FAILED) {
+                if (download.state == Download.STATE_FAILED && YouTube.isAgeRestricted(finalException)) {
+                    // Only a signed-in account can get it from YouTube; the computer can send it.
+                    fromComputer.remove(id)
+                    startingOver.remove(id)
+                    markAgeRestricted(id, true)
+                } else if (download.state == Download.STATE_FAILED) {
                     val switching = startingOver.remove(id)
                     val computerQuit = fromComputer.remove(id)
                     // The computer stopped sending (its window closed?): YouTube for this one now.
@@ -334,6 +357,7 @@ object Offline {
                     fromComputer.remove(id)
                     restarts.remove(id)
                     clearOrigin(id)
+                    markAgeRestricted(id, false)  // it arrived (from the computer)
                 }
                 refresh()
             }
@@ -386,7 +410,11 @@ object Offline {
                     if (id !in ids) send { DownloadService.sendRemoveDownload(app, SongDownloadService::class.java, id, false) }
                 }
                 if (enabled) {
+                    val restricted = _ageRestricted.value
+                    val offered = computer?.songs ?: emptySet()
                     for (id in ids) {
+                        // YouTube won't give the phone an age-restricted song; only the computer can.
+                        if (id in restricted && id !in offered) continue
                         val state = known[id]
                         if (state == null || (retry && state == Download.STATE_FAILED)) {
                             send { DownloadService.sendAddDownload(app, SongDownloadService::class.java, request(id), false) }
@@ -469,6 +497,8 @@ object Offline {
             all.putAll(live)  // the index only updates on state changes; these have live progress
             var done = 0
             var failed = 0
+            var restricted = 0
+            val restrictedIds = _ageRestricted.value
             var downloading = 0
             var queued = 0
             var partial = 0f
@@ -480,7 +510,7 @@ object Offline {
                         done += 1
                         savedIds.add(id)
                     }
-                    Download.STATE_FAILED -> failed += 1
+                    Download.STATE_FAILED -> if (id in restrictedIds) restricted += 1 else failed += 1
                     Download.STATE_DOWNLOADING -> {
                         downloading += 1
                         partial += download.percentDownloaded.coerceAtLeast(0f) / 100f
@@ -506,6 +536,7 @@ object Offline {
                 computerSpeed = fromPcSpeed,
                 youtubeSpeed = fromYtSpeed,
                 computerConnected = connected,
+                ageRestricted = restricted,
             )
         }
     }
@@ -525,7 +556,7 @@ object Offline {
         return buildString {
             appendLine("Tapedeck saving details")
             appendLine("Songs: ${state.total}; saved ${state.saved}, saving ${state.downloading}, " +
-                "waiting ${state.queued}, failed ${state.failed}")
+                "waiting ${state.queued}, failed ${state.failed}, age-restricted ${state.ageRestricted}")
             appendLine("Saving: ${if (state.enabled) "on" else "off"}; mobile data: " +
                 "${if (preferencesInstance?.getBoolean("mobile", false) == true) "allowed" else "not allowed"}; " +
                 "paused: ${if (manager?.downloadsPaused == true) "yes" else "no"}")

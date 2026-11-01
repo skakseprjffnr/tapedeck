@@ -48,7 +48,7 @@ from PySide6.QtCore import (
     QRect, QRectF, QSize, Qt, QTimer, QUrl, QVariantAnimation, Signal,
 )
 from PySide6.QtGui import (
-    QColor, QCursor, QFont, QFontMetrics, QIcon, QIntValidator, QKeySequence,
+    QColor, QCursor, QDesktopServices, QFont, QFontMetrics, QIcon, QIntValidator, QKeySequence,
     QPainter, QPainterPath, QPalette, QPen, QPixmap, QShortcut, QTextOption,
 )
 from PySide6.QtNetwork import (
@@ -56,7 +56,7 @@ from PySide6.QtNetwork import (
     QNetworkReply, QNetworkRequest, QTcpServer,
 )
 from PySide6.QtWidgets import (
-    QAbstractButton, QApplication, QFrame, QGraphicsDropShadowEffect,
+    QAbstractButton, QApplication, QComboBox, QFileDialog, QFrame, QGraphicsDropShadowEffect,
     QGraphicsOpacityEffect, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QMenu, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QStackedWidget,
     QVBoxLayout,
@@ -66,7 +66,7 @@ from PySide6.QtWidgets import (
 APP_NAME = "Tapedeck"
 APP_ID = "tapedeck"
 IS_WINDOWS = sys.platform == "win32"
-VERSION = "0.9.2"
+VERSION = "0.10.0"
 
 # ── Design tokens ────────────────────────────────────────────────────────────
 # Strict black and white. The accent only marks actions and what is playing.
@@ -933,7 +933,7 @@ class MetaFetcher(QObject):
             process.setProgram(tool("yt-dlp"))
             process.setArguments([
                 "-J", "--no-playlist", "--no-warnings", "--ignore-no-formats-error",
-                "--socket-timeout", "15", watch_url(video_id),
+                "--socket-timeout", "15", *account_args(process), watch_url(video_id),
             ])
             process.finished.connect(
                 lambda code, _status, p=process, v=video_id: self._ytdlp_done(p, v, code))
@@ -1059,9 +1059,9 @@ class PlaylistJob(QObject):
         self._timer.timeout.connect(self._timed_out)
 
     def start(self) -> None:
-        args = ["-J", "--flat-playlist", "--socket-timeout", "15",
-                playlist_url(self.list_id, self.video_id)]
         process = QProcess(self)
+        args = ["-J", "--flat-playlist", "--socket-timeout", "15", *account_args(process),
+                playlist_url(self.list_id, self.video_id)]
         process.setProgram(tool("yt-dlp"))
         process.setArguments(args)
         process.finished.connect(
@@ -2030,8 +2030,9 @@ class DownloadJob(QObject):
         args = ["-f", AUDIO_FORMAT, "--no-playlist", "--no-progress", "--quiet", "--no-mtime",
                 "--socket-timeout", "15", "--retries", "3",
                 "-P", str(self.folder), "-o", "%(id)s.%(ext)s",
-                "--print", "after_move:filepath", "--no-simulate", watch_url(self.video_id)]
+                "--print", "after_move:filepath", "--no-simulate"]
         process = QProcess(self)
+        args += [*account_args(process), watch_url(self.video_id)]
         process.setProgram(tool("yt-dlp"))
         process.setArguments(args)
         process.finished.connect(
@@ -2228,6 +2229,10 @@ class AudioCache(QObject):
         self.changed.emit()
         self._pump()
 
+    def retry_failed(self) -> None:
+        """Songs that couldn't be saved (age-restricted ones, say) may try again right away."""
+        self._retry_at.clear()
+
     def keep_only(self, video_ids: set[str]) -> None:
         stale = [video_id for video_id in self.files if video_id not in video_ids]
         if stale:
@@ -2290,6 +2295,198 @@ class AudioCache(QObject):
 # is looked up with yt-dlp; YouTube refuses its stream (HTTP 403) until a few
 # seconds after the lookup ("available_at"), so Tapedeck waits that out.
 
+# ── YouTube account ──────────────────────────────────────────────────────────
+# Age-restricted videos play only for a signed-in YouTube account old enough to see them.
+# Google blocks its sign-in page inside apps like this one, and yt-dlp no longer has a sign-in
+# of its own, so Tapedeck uses the YouTube sign-in of a web browser (yt-dlp reads it), or a
+# cookies.txt file exported from one.
+BROWSERS = (("firefox", "Firefox"), ("chrome", "Google Chrome"), ("chromium", "Chromium"),
+            ("brave", "Brave"), ("edge", "Microsoft Edge"), ("vivaldi", "Vivaldi"),
+            ("opera", "Opera"))
+CHROMIUM_FAMILY = {"chrome", "chromium", "brave", "edge", "vivaldi", "opera"}
+ACCOUNT = {"browser": "", "file": ""}
+SIGNED_IN_COOKIES = {"SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID", "SID", "LOGIN_INFO"}
+
+
+def set_account(browser: str = "", cookie_file: str = "") -> None:
+    ACCOUNT["browser"] = browser if browser in dict(BROWSERS) else ""
+    ACCOUNT["file"] = "" if ACCOUNT["browser"] else (cookie_file or "")
+
+
+def account_label() -> str:
+    """How Tapedeck signs in, for messages: "Firefox", "your cookies file", or ""."""
+    if ACCOUNT["browser"]:
+        return dict(BROWSERS)[ACCOUNT["browser"]]
+    return "your cookies file" if ACCOUNT["file"] else ""
+
+
+def cookie_copies_folder() -> Path:
+    return AUDIO_DIR.parent / "cookies"
+
+
+def account_args(process: QProcess | None = None) -> list[str]:
+    """yt-dlp options that sign in to YouTube; nothing when no account is set up.
+
+    A cookies file goes to each yt-dlp as its own copy: yt-dlp writes cookies back as it
+    exits, and several running at once would overwrite each other's.
+    """
+    if ACCOUNT["browser"]:
+        return ["--cookies-from-browser", ACCOUNT["browser"]]
+    source = Path(ACCOUNT["file"]) if ACCOUNT["file"] else None
+    if source is None or not source.is_file():
+        return []
+    try:
+        folder = cookie_copies_folder()
+        folder.mkdir(parents=True, exist_ok=True)
+        handle, name = tempfile.mkstemp(prefix="cookies-", suffix=".txt", dir=str(folder))
+        with os.fdopen(handle, "wb") as copy:
+            copy.write(source.read_bytes())
+    except OSError as exc:
+        log.warning("Couldn't use the cookies file: %s", exc)
+        return []
+    if process is not None:
+        process.finished.connect(lambda *_: Path(name).unlink(missing_ok=True))
+    return ["--cookies", name]
+
+
+def youtube_signed_in(cookies: str) -> bool:
+    """Whether a Netscape cookies file holds a YouTube sign-in."""
+    for line in cookies.splitlines():
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        parts = line.split("\t")
+        if len(parts) >= 7 and not line.startswith("#") and \
+                parts[0].lstrip(".").endswith("youtube.com") and \
+                parts[5] in SIGNED_IN_COOKIES and parts[6].strip():
+            return True
+    return False
+
+
+def open_folder(path: Path) -> bool:
+    """Show a folder in the file manager."""
+    path.mkdir(parents=True, exist_ok=True)
+    return bool(QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))))
+
+
+class AccountCheck(QObject):
+    """Checks that the chosen browser (or cookies file) really holds a YouTube sign-in."""
+
+    finished = Signal(bool, str)  # signed in, what to tell the person
+
+    def __init__(self, browser: str, cookie_file: str, video_id: str,
+                 parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.browser, self.cookie_file, self.video_id = browser, cookie_file, video_id
+        self.dump = ""
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._timed_out)
+        self._process: QProcess | None = None
+
+    @property
+    def name(self) -> str:
+        return dict(BROWSERS).get(self.browser, "That browser")
+
+    def start(self) -> None:
+        if not self.browser:  # a cookies file can be read directly
+            ok, text = self.judge_file()
+            QTimer.singleShot(0, lambda: self.finished.emit(ok, text))
+            return
+        if not self.video_id:
+            QTimer.singleShot(0, lambda: self.finished.emit(
+                False, "Add a song first: the check asks YouTube about one of your songs."))
+            return
+        folder = cookie_copies_folder()
+        folder.mkdir(parents=True, exist_ok=True)
+        handle, self.dump = tempfile.mkstemp(prefix="check-", suffix=".txt", dir=str(folder))
+        os.close(handle)
+        process = QProcess(self)
+        process.setProgram(tool("yt-dlp"))
+        # Reading the browser's cookies and saving them to the private dump file shows what
+        # yt-dlp would sign in with; the dump is deleted right after.
+        process.setArguments(["--cookies-from-browser", self.browser, "--cookies", self.dump,
+                              "--skip-download", "--no-playlist", "--no-warnings",
+                              "--ignore-no-formats-error", "--print", "id",
+                              "--socket-timeout", "15", watch_url(self.video_id)])
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        process.finished.connect(lambda _code, _status, p=process: self._done(p))
+        process.errorOccurred.connect(lambda error, p=process: self._failed_to_start(p, error))
+        self._process = process
+        self._timer.start(60_000)
+        process.start()
+
+    def judge_file(self) -> tuple[bool, str]:
+        path = Path(self.cookie_file)
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False, "That cookies file is gone or can't be read. Choose it again."
+        if youtube_signed_in(text):
+            return True, "Signed in: that file holds a YouTube sign-in."
+        return False, ("That file has no YouTube sign-in. Export the cookies while you're "
+                       "signed in at youtube.com.")
+
+    def _done(self, process: QProcess) -> None:
+        self._timer.stop()
+        output = bytes(process.readAllStandardOutput()).decode("utf-8", "replace")
+        try:
+            cookies = Path(self.dump).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            cookies = ""
+        Path(self.dump).unlink(missing_ok=True)
+        if youtube_signed_in(cookies):
+            self.finished.emit(True, f"Signed in: {self.name} has a YouTube sign-in. "
+                                     "Age-restricted songs will play and save.")
+        else:
+            self.finished.emit(False, self.explain(output, bool(cookies.strip())))
+        process.deleteLater()
+
+    def explain(self, output: str, read_any: bool) -> str:
+        name, low = self.name, output.lower()
+        if "could not find" in low and ("cookie" in low or "profile" in low):
+            return f"{name} doesn't seem to be set up on this computer: no profile was found."
+        if re.search(r"failed to decrypt|dpapi|app.bound|decrypt", low):
+            if IS_WINDOWS:
+                return (f"Windows doesn't let other apps read {name}'s sign-in. Use Firefox, "
+                        "or a cookies.txt file.")
+            return f"yt-dlp couldn't unlock {name}'s sign-in. " + self.keyring_hint()
+        if "secretstorage" in low or "keyring" in low:
+            return f"yt-dlp couldn't unlock {name}'s sign-in. " + self.keyring_hint()
+        if read_any:
+            return (f"{name} isn't signed in to YouTube. Sign in at youtube.com in {name}, "
+                    "then check again.")
+        lines = [line for line in output.splitlines() if line.strip()]
+        return "Couldn't check the sign-in. " + describe_failure(lines)
+
+    def keyring_hint(self) -> str:
+        if self.browser in CHROMIUM_FAMILY and not IS_WINDOWS:
+            return ("It needs Python's secretstorage module to read Chromium-based browsers: "
+                    "on Arch, sudo pacman -S python-secretstorage. Firefox works without it.")
+        return "Firefox is the most dependable choice."
+
+    def _failed_to_start(self, process: QProcess, error) -> None:
+        if error == QProcess.ProcessError.FailedToStart:
+            self._timer.stop()
+            Path(self.dump).unlink(missing_ok=True)
+            self.finished.emit(False, "Checking needs yt-dlp. " + install_hint("yt-dlp"))
+
+    def _timed_out(self) -> None:
+        if self._process is not None:
+            self._process.kill()
+
+
+AGE_RESTRICTED = re.compile(r"confirm your age|age[- ]restricted|inappropriate for some users",
+                            re.IGNORECASE)
+
+
+def age_restricted_hint() -> str:
+    if account_label():
+        return (f"This song is age-restricted, and YouTube didn't accept the sign-in from "
+                f"{account_label()}. Check in Settings that it's still signed in.")
+    return ("This song is age-restricted: YouTube only plays it for a signed-in account. "
+            "Sign in under Settings, YouTube account.")
+
+
 AUDIO_FORMAT = "bestaudio/best"
 FORBIDDEN = re.compile(r"\b403\b|forbidden", re.IGNORECASE)
 STREAM_URL = re.compile(r"https?://[^\s'\"]*googlevideo\.com[^\s'\"]*")
@@ -2297,8 +2494,9 @@ GENERIC_LINE = re.compile(
     r"^(exiting\.\.\.|failed to recognize file format|playing:|\(\+\)|ao:|a:|audio:|file tags:)",
     re.IGNORECASE)
 FAILURE_HINTS = (
-    (r"confirm your age|age[- ]restricted",
-     "This video is age-restricted, which needs a signed-in YouTube account."),
+    (r"failed to decrypt|could not find .*cookies|cookies database|secretstorage",
+     "yt-dlp couldn't read the browser's YouTube sign-in. Settings can check it, under "
+     "YouTube account."),
     (r"sign in to confirm you",
      "YouTube wants a sign-in to prove you're not a bot. This mostly happens on VPNs "
      "and shared networks."),
@@ -2337,6 +2535,8 @@ def log_hint() -> str:
 def describe_failure(lines: list[str]) -> str:
     """Explain a yt-dlp or mpv failure in one or two plain sentences."""
     text = "\n".join(lines)
+    if AGE_RESTRICTED.search(text):
+        return age_restricted_hint()
     for pattern, message in FAILURE_HINTS:
         if re.search(pattern, text, re.IGNORECASE):
             return message
@@ -2421,9 +2621,9 @@ class ResolveJob(QObject):
         self._timer.timeout.connect(self._timed_out)
 
     def start(self) -> None:
-        args = ["-J", "--no-playlist", "-f", AUDIO_FORMAT, "--socket-timeout", "15",
-                watch_url(self.video_id)]
         process = QProcess(self)
+        args = ["-J", "--no-playlist", "-f", AUDIO_FORMAT, "--socket-timeout", "15",
+                *account_args(process), watch_url(self.video_id)]
         process.setProgram(tool("yt-dlp"))
         process.setArguments(args)
         process.finished.connect(
@@ -6056,10 +6256,15 @@ class AccentPreview(QWidget):
         painter.drawEllipse(QPointF(played, 24), 6.5, 6.5)
 
 
-class SettingsSheet(Sheet):
-    """Accent color and instant-play saving."""
+ACCOUNT_HINT = ("Age-restricted songs play only for a signed-in YouTube account. Sign in at "
+                "youtube.com in a web browser, then choose it here: Google blocks signing in "
+                "inside apps, so Tapedeck uses your browser's sign-in.")
 
-    submitted = Signal(str, bool)  # accent color, save songs for instant play
+
+class SettingsSheet(Sheet):
+    """Accent color, saving songs, the YouTube account, and where songs are kept."""
+
+    submitted = Signal(str, bool, str, str)  # accent, save songs, sign-in browser, cookies file
 
     def __init__(self, ctx: Ctx) -> None:
         super().__init__("Settings", primary="Save")
@@ -6098,6 +6303,49 @@ class SettingsSheet(Sheet):
                                    f"{size_text(ctx.cache.size_bytes())}")
         self.save_check.setChecked(ctx.cache.enabled)
         self.body.addWidget(self.save_check)
+        inner = z(460) - 2 * z(26)
+        folder = QHBoxLayout()
+        folder.setSpacing(z(10))
+        folder.addWidget(wrapped_label(f"Saved songs are kept in {pretty_path(AUDIO_DIR)}",
+                                       "FieldHint", make_font(12), inner - z(130)), 1)
+        open_button = QPushButton("Open folder")
+        open_button.setObjectName("Ghost")
+        open_button.setFont(make_font(12, QFont.Weight.Medium))
+        open_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        open_button.clicked.connect(lambda: open_folder(AUDIO_DIR))
+        folder.addWidget(open_button, 0, Qt.AlignmentFlag.AlignTop)
+        self.body.addLayout(folder)
+
+        self.body.addWidget(plain_label("YouTube account", "FieldLabel",
+                                        make_font(13, QFont.Weight.Medium)))
+        account = QHBoxLayout()
+        account.setSpacing(z(8))
+        self.account_choice = QComboBox()
+        self.account_choice.setObjectName("Choice")
+        self.account_choice.setFont(make_font(13))
+        self.account_choice.addItem("Not signed in", "")
+        for key, name in BROWSERS:
+            self.account_choice.addItem(f"Use {name}'s sign-in", key)
+        self.account_choice.addItem("Use a cookies.txt file", "file")
+        self.cookie_file = ctx.settings.get("account_file", "") or ""
+        current = ctx.settings.get("account_browser", "") or ("file" if self.cookie_file else "")
+        self.account_choice.setCurrentIndex(max(0, self.account_choice.findData(current)))
+        account.addWidget(self.account_choice, 1)
+        self.file_button = QPushButton("Choose file")
+        self.check_button = QPushButton("Check")
+        for button in (self.file_button, self.check_button):
+            button.setObjectName("Ghost")
+            button.setFont(make_font(12, QFont.Weight.Medium))
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            account.addWidget(button)
+        self.file_button.clicked.connect(self._choose_file)
+        self.check_button.clicked.connect(self._check_account)
+        self.body.addLayout(account)
+        self.account_hint = wrapped_label("", "FieldHint", make_font(12), inner, lines=3)
+        self.body.addWidget(self.account_hint)
+        self._check: AccountCheck | None = None
+        self.account_choice.currentIndexChanged.connect(self._account_changed)
+        self._account_changed()
         zoom = plain_label(f"Zoom is {round(ZOOM * 100)}%. Change it with Ctrl+scroll or "
                            "Ctrl+plus and minus; Ctrl+0 resets it.", "FieldHint", make_font(12))
         zoom.setWordWrap(True)
@@ -6127,10 +6375,70 @@ class SettingsSheet(Sheet):
         set_flag(self.accent_hint, "error", warn)
         self.primary.setEnabled(color is not None)
 
+    @property
+    def account(self) -> tuple[str, str]:
+        """(browser, cookies file) as chosen; at most one of them is set."""
+        choice = self.choice
+        if choice == "file":
+            return "", self.cookie_file
+        return choice, ""
+
+    @property
+    def choice(self) -> str:
+        """The dropdown's choice: "", a browser's key, or "file"."""
+        data = self.account_choice.currentData()
+        return data if isinstance(data, str) and (data == "file" or data in dict(BROWSERS)) else ""
+
+    def _account_changed(self, *_args) -> None:
+        choice = self.choice
+        self.file_button.setVisible(choice == "file")
+        self.check_button.setEnabled(bool(choice) and (choice != "file" or bool(self.cookie_file)))
+        if choice == "file" and not self.cookie_file:
+            text = "Choose the cookies.txt file you exported while signed in at youtube.com."
+        elif choice == "file":
+            text = (f"Using {pretty_path(Path(self.cookie_file))}. After exporting it, close that "
+                    "browser window, or YouTube may replace the sign-in it holds.")
+        elif choice:
+            name = dict(BROWSERS)[choice]
+            text = (f"Tapedeck uses the YouTube sign-in in {name}; Check makes sure it's there. "
+                    "YouTube can limit accounts used by download tools, so a second Google "
+                    "account is safest.")
+            if IS_WINDOWS and choice in CHROMIUM_FAMILY:
+                text += " On Windows, only Firefox lets other apps read its sign-in."
+        else:
+            text = ACCOUNT_HINT
+        self._set_hint(text, error=False)
+
+    def _set_hint(self, text: str, error: bool) -> None:
+        self.account_hint.setText(text)
+        set_flag(self.account_hint, "error", error)
+
+    def _choose_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Choose a cookies.txt file", str(Path.home()),
+                                              "Cookie files (*.txt);;All files (*)")
+        if path:
+            self.cookie_file = path
+            self._account_changed()
+
+    def _check_account(self) -> None:
+        browser, cookie_file = self.account
+        first = next((song.video_id for song in self.ctx.library.songs.values()), "")
+        self.check_button.setEnabled(False)
+        self._set_hint("Checking…", error=False)
+        check = AccountCheck(browser, cookie_file, first, self)
+        check.finished.connect(self._checked)
+        self._check = check
+        check.start()
+
+    def _checked(self, ok: bool, text: str) -> None:
+        self.check_button.setEnabled(True)
+        self._set_hint(text, error=not ok)
+
     def on_primary(self) -> None:
         color = self.color
         if color is not None:
-            self.submitted.emit(color, self.save_check.isChecked())
+            browser, cookie_file = self.account
+            self.submitted.emit(color, self.save_check.isChecked(), browser, cookie_file)
 
 
 SONG_CATEGORIES_HINT = ("The song is in the ticked categories. Tick others to add it to their "
@@ -7525,17 +7833,39 @@ class MainWindow(QMainWindow):
         sheet = SettingsSheet(self.ctx)
         overlay = self._open_sheet(sheet)
 
-        def save(color: str, saving: bool) -> None:
+        def save(color: str, saving: bool, browser: str, cookie_file: str) -> None:
             overlay.dismiss()
             cache = self.ctx.cache
             if saving != cache.enabled:
                 cache.set_enabled(saving)
                 if saving:
                     cache.want_library(self.ctx.library)
+            message = self.apply_account(browser, cookie_file)
             if color != ACCENT:  # after this click finishes: the rebuild replaces the button
                 later(0, lambda: self.apply_accent(color))
+            if message:
+                later(10, lambda: self.notify(message))  # after any rebuild, on the new window
 
         sheet.submitted.connect(save)
+
+    def apply_account(self, browser: str, cookie_file: str) -> str:
+        """Use a new YouTube sign-in; songs that failed for lack of one try again."""
+        if (browser, cookie_file) == (ACCOUNT["browser"], ACCOUNT["file"]):
+            return ""
+        settings = self.ctx.settings
+        settings.set("account_browser", browser)
+        settings.set("account_file", cookie_file)
+        set_account(browser, cookie_file)
+        if not account_label():
+            return "Not signed in to YouTube any more"
+        cache, library = self.ctx.cache, self.ctx.library
+        cache.retry_failed()
+        if cache.enabled:
+            cache.want_library(library)
+        for song in library.songs.values():  # lengths that couldn't be looked up
+            if song.duration is None:
+                self.ctx.fetcher.request(song.video_id)
+        return f"Signed in with {account_label()}. Age-restricted songs will try again."
 
     def apply_accent(self, color: str) -> None:
         set_accent(color)
@@ -7739,6 +8069,13 @@ QLineEdit {{ background: {BLACK}; color: {WHITE}; border: 1px solid {HAIRLINE_HI
             border-radius: 9px; padding: 9px 12px;
             selection-background-color: {ACCENT}; selection-color: {ON_ACCENT}; }}
 QLineEdit:focus {{ border: 1px solid {ACCENT}; }}
+QComboBox#Choice {{ background: {BLACK}; color: {WHITE}; border: 1px solid {HAIRLINE_HI};
+            border-radius: 9px; padding: 8px 12px; }}
+QComboBox#Choice:focus, QComboBox#Choice:on {{ border: 1px solid {ACCENT}; }}
+QComboBox#Choice::drop-down {{ border: none; width: 26px; }}
+QComboBox#Choice QAbstractItemView {{ background: {BLACK}; color: {WHITE};
+            border: 1px solid {HAIRLINE_HI}; outline: none; padding: 4px;
+            selection-background-color: {ACCENT}; selection-color: {ON_ACCENT}; }}
 QPlainTextEdit#PasteBox {{ background: {BLACK}; color: {WHITE}; border: 1px solid {HAIRLINE_HI};
             border-radius: 9px; padding: 5px 7px;
             selection-background-color: {ACCENT}; selection-color: {ON_ACCENT}; }}
@@ -7944,6 +8281,10 @@ def main() -> int:
     app.setStyle("Fusion")
 
     ctx = Ctx()
+    shutil.rmtree(cookie_copies_folder(), ignore_errors=True)  # copies left by a crash
+    set_account(ctx.settings.get("account_browser", "") or "", ctx.settings.get("account_file", "") or "")
+    if account_label():
+        log.info("Signing in to YouTube with %s", account_label())
     set_zoom(ctx.settings.get("zoom", 1.0))
     set_accent(ctx.settings.get("accent", DEFAULT_ACCENT))
     apply_app_style(app)

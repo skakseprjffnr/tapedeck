@@ -165,6 +165,14 @@ private fun Player.snapshot(): PlayerUi {
     )
 }
 
+/** Android's page for Tapedeck, which shows the storage its saved songs use. */
+private fun openAppStorage(context: Context) {
+    val intent = Intent(AndroidSettings.ACTION_APPLICATION_DETAILS_SETTINGS,
+        android.net.Uri.parse("package:${context.packageName}"))
+        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    runCatching { context.startActivity(intent) }
+}
+
 /** Tapedeck's page in the phone's notification settings. */
 private fun openNotificationSettings(context: Context) {
     val intent = Intent(AndroidSettings.ACTION_APP_NOTIFICATION_SETTINGS)
@@ -226,6 +234,7 @@ fun TapedeckApp(store: LibraryStore, controller: MediaController?) {
     val context = LocalContext.current
     val status by Offline.status.collectAsState()
     val saved by Offline.saved.collectAsState()
+    val restricted by Offline.ageRestricted.collectAsState()
     var mobileData by remember { mutableStateOf(Offline.mobileDataAllowed(context)) }
     // Checked on every recomposition (each second while saving), so coming back from the
     // phone's settings shows the change.
@@ -292,6 +301,7 @@ fun TapedeckApp(store: LibraryStore, controller: MediaController?) {
                                     category = category,
                                     playingId = player.videoId,
                                     saved = saved,
+                                    restricted = restricted,
                                     store = store,
                                     onBack = { screen = Screen.Library },
                                     onPlay = { index, shuffle -> playCategory(controller, category, index, shuffle) },
@@ -489,6 +499,13 @@ private fun SavingPanel(
                     style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 4.dp))
                 TextButton(onClick = onNotifications) { Text("Show progress in notifications") }
             }
+            if (status.ageRestricted > 0) {
+                Text("${songCount(status.ageRestricted)} ${if (status.ageRestricted == 1) "is" else "are"} " +
+                    "age-restricted, so only your computer can send them: sign in there (Settings, " +
+                    "YouTube account), let it save them, then scan its code.",
+                    color = Smoke, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 6.dp))
+                TextButton(onClick = onScan) { Text("Scan the computer's code") }
+            }
             if (status.failed > 0) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("${status.failed} couldn't be saved.", color = Danger, style = MaterialTheme.typography.bodySmall,
@@ -535,6 +552,7 @@ private fun CategoryScreen(
     category: Category,
     playingId: String?,
     saved: Set<String>,
+    restricted: Set<String>,
     store: LibraryStore,
     onBack: () -> Unit,
     onPlay: (Int?, Boolean) -> Unit,
@@ -599,6 +617,7 @@ private fun CategoryScreen(
                     song = song,
                     playing = song.videoId == playingId,
                     saved = song.videoId in saved,
+                    restricted = song.videoId in restricted && song.videoId !in saved,
                     onClick = { onPlay(index, false) },
                     onRemove = { store.removeSong(category.id, song.videoId) },
                 )
@@ -632,6 +651,7 @@ private fun SongRow(
     song: Song,
     playing: Boolean,
     saved: Boolean,
+    restricted: Boolean,
     onClick: () -> Unit,
     onRemove: () -> Unit,
 ) {
@@ -662,7 +682,10 @@ private fun SongRow(
         Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
             Text(song.title.ifEmpty { "Looking up the title…" }, color = if (playing) accent else Color.White,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
-            if (song.channel.isNotEmpty()) {
+            if (restricted) {
+                Text("Age-restricted: it can come from your computer", color = Smoke,
+                    style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            } else if (song.channel.isNotEmpty()) {
                 Text(song.channel, color = Smoke, style = MaterialTheme.typography.bodySmall,
                     maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
@@ -1028,6 +1051,15 @@ private fun SettingsScreen(
                 }) { Text("Copy saving details") }
                 OutlinedButton(onClick = { confirmDelete = true }) { Text("Delete saved songs", color = Danger) }
             }
+
+            HorizontalDivider(color = Line, modifier = Modifier.padding(vertical = 4.dp))
+            Text("Saved songs folder", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text(Offline.folderPath(context), style = MaterialTheme.typography.bodySmall)
+            Text("${songCount(status.saved)}, ${formatBytes(status.bytes)}. They're in Tapedeck's own " +
+                "storage, in the player's own format, so only Tapedeck can play them and file " +
+                "managers can't open the folder. Android's page for Tapedeck shows the space they use.",
+                color = Smoke, style = MaterialTheme.typography.bodySmall)
+            OutlinedButton(onClick = { openAppStorage(context) }) { Text("Show in Android settings") }
             Spacer(Modifier.height(12.dp))
         }
     }

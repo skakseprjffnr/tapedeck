@@ -1,6 +1,6 @@
 # Personal package. Build and install with: makepkg -si
 pkgname=tapedeck
-pkgver=0.9.2
+pkgver=0.10.0
 pkgrel=1
 pkgdesc="Personal YouTube playlist builder: categories, drag-to-reorder, audio playback via mpv"
 arch=('any')
