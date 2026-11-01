@@ -10,6 +10,7 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.session.MediaSession
@@ -35,8 +36,25 @@ class PlaybackService : MediaSessionService() {
             .setCache(Offline.cache(this))
             .setUpstreamDataSourceFactory(Offline.upstream())
             .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+        // The player's defaults are made for video: keep under a minute ahead, throw away what
+        // has played, and wait for 2.5 s of audio after every jump. So each jump reloaded the
+        // song, from YouTube or the computer when that part wasn't stored, which was the pause.
+        // A song is only a few MB: keep all of it loaded, played part included (up to 32 MB),
+        // so jumping anywhere in it is instant, and resume after half a second otherwise.
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                600_000,  // keep loading until 10 minutes ahead are loaded...
+                600_000,  // ...which covers nearly every song entirely
+                500,      // after a jump outside what's loaded: half a second of audio
+                1_000,    // after running dry mid-song: a second
+            )
+            .setBackBuffer(600_000, true)  // keep what's been played, so rewinding is instant too
+            .setTargetBufferBytes(32 * 1024 * 1024)
+            .setPrioritizeTimeOverSizeThresholds(false)  // the 32 MB cap wins over the 10 minutes
+            .build()
         val player = ExoPlayer.Builder(this)
             .setMediaSourceFactory(DefaultMediaSourceFactory(cached))
+            .setLoadControl(loadControl)
             .setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(C.USAGE_MEDIA)

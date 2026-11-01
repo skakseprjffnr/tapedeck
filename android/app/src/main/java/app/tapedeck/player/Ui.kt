@@ -334,7 +334,7 @@ fun TapedeckApp(store: LibraryStore, controller: MediaController?) {
                                     mobileData = allowed
                                     Offline.setMobileData(context, allowed)
                                 },
-                                onDeleteSaved = { Offline.deleteSaved(context) },
+                                onClearCache = { resave -> Offline.clearCache(context, store.categories.value, resave) },
                                 notificationsOn = notificationsOn,
                                 onNotifications = { openNotificationSettings(context) },
                             )
@@ -963,7 +963,7 @@ private fun SettingsScreen(
     onBack: () -> Unit,
     onSaving: (Boolean) -> Unit,
     onMobileData: (Boolean) -> Unit,
-    onDeleteSaved: () -> Unit,
+    onClearCache: (Boolean) -> Unit,
     notificationsOn: Boolean,
     onNotifications: () -> Unit,
 ) {
@@ -975,7 +975,7 @@ private fun SettingsScreen(
     LaunchedEffect(accentHex) {  // a preset or a reset updates the field
         if (normalizeHex(typed) != accentHex) typed = accentHex
     }
-    var confirmDelete by remember { mutableStateOf(false) }
+    var confirmClear by remember { mutableStateOf<String?>(null) }  // "clear" or "resave"
     var audioFormat by remember { mutableStateOf(Offline.audioFormat(context)) }
     var audioQuality by remember { mutableStateOf(Offline.audioQuality(context)) }
     val accent = MaterialTheme.colorScheme.primary
@@ -1124,12 +1124,13 @@ private fun SettingsScreen(
             Text("${formatBytes(status.bytes)} used by saved songs. ${status.saved} of ${status.total} " +
                 "saved, ${status.downloading} saving now, ${status.queued} waiting, ${status.failed} failed.",
                 color = Smoke, style = MaterialTheme.typography.bodySmall)
+            OutlinedButton(onClick = {
+                clipboard.setText(AnnotatedString(Offline.report(notificationsOn)))
+                Toast.makeText(context, "Saving details copied", Toast.LENGTH_SHORT).show()
+            }) { Text("Copy saving details") }
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                OutlinedButton(onClick = {
-                    clipboard.setText(AnnotatedString(Offline.report(notificationsOn)))
-                    Toast.makeText(context, "Saving details copied", Toast.LENGTH_SHORT).show()
-                }) { Text("Copy saving details") }
-                OutlinedButton(onClick = { confirmDelete = true }) { Text("Delete saved songs", color = Danger) }
+                OutlinedButton(onClick = { confirmClear = "clear" }) { Text("Clear cache", color = Danger) }
+                OutlinedButton(onClick = { confirmClear = "resave" }) { Text("Clear and re-save all") }
             }
 
             HorizontalDivider(color = Line, modifier = Modifier.padding(vertical = 4.dp))
@@ -1143,22 +1144,39 @@ private fun SettingsScreen(
             Spacer(Modifier.height(12.dp))
         }
     }
-    if (confirmDelete) {
+    confirmClear?.let { action ->
+        val resave = action == "resave"
+        val formatName = mapOf("auto" to "the best available format", "opus" to "Opus", "aac" to "AAC")[audioFormat]
+            ?: "the best available format"
+        val qualityName = mapOf("best" to "best quality", "medium" to "about 128 kbps", "small" to "about 64 kbps")[audioQuality]
+            ?: "best quality"
         AlertDialog(
-            onDismissRequest = { confirmDelete = false },
-            title = { Text("Delete saved songs?") },
+            onDismissRequest = { confirmClear = null },
+            title = { Text(if (resave) "Re-save every song?" else "Clear the cache?") },
             text = {
-                Text("They'll stream from YouTube again, and saving stays off until you turn it " +
-                    "back on. Your library stays as it is.")
+                Text(
+                    if (resave) {
+                        "Every stored song is deleted and saved again in $formatName, $qualityName: " +
+                            "${songCount(status.total.coerceAtLeast(status.saved))} to download. Songs " +
+                            "your computer sends (scan its code while this runs) come in its format. " +
+                            "Your library stays as it is."
+                    } else {
+                        "Saved and partly played songs, song images and remembered stream addresses " +
+                            "are deleted from this phone. Saving every song automatically turns off, so " +
+                            "they aren't saved again straight away. Your library stays as it is."
+                    },
+                )
             },
             confirmButton = {
                 TextButton(onClick = {
-                    confirmDelete = false
-                    onDeleteSaved()
-                }) { Text("Delete", color = Danger) }
+                    confirmClear = null
+                    onClearCache(resave)
+                    Toast.makeText(context, if (resave) "Re-saving every song" else "Cache cleared",
+                        Toast.LENGTH_SHORT).show()
+                }) { Text(if (resave) "Clear and re-save" else "Clear", color = Danger) }
             },
             dismissButton = {
-                TextButton(onClick = { confirmDelete = false }) { Text("Cancel") }
+                TextButton(onClick = { confirmClear = null }) { Text("Cancel") }
             },
             containerColor = Raised,
         )

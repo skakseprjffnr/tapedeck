@@ -25,6 +25,7 @@ import androidx.media3.exoplayer.offline.DownloadRequest
 import androidx.media3.exoplayer.offline.DownloadService
 import androidx.media3.exoplayer.scheduler.Requirements
 import androidx.media3.exoplayer.scheduler.Scheduler
+import coil.imageLoader
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
@@ -118,6 +119,13 @@ object Offline {
 
     @Volatile
     private var wanted: Set<String> = emptySet()
+
+    @Volatile
+    private var library: List<Category> = emptyList()  // as of the last sync
+
+    /** Set while the old copies are being removed; saving starts over once that's done. */
+    @Volatile
+    private var resaveWhenIdle = false
 
     private val _status = MutableStateFlow(SaveStatus())
     val status: StateFlow<SaveStatus> = _status.asStateFlow()
@@ -410,7 +418,13 @@ object Offline {
 
             override fun onDownloadRemoved(downloadManager: DownloadManager, download: Download) = refresh()
 
-            override fun onIdle(downloadManager: DownloadManager) = refresh()
+            override fun onIdle(downloadManager: DownloadManager) {
+                if (resaveWhenIdle && downloadManager.currentDownloads.isEmpty()) {
+                    resaveWhenIdle = false
+                    sync(app, library, retryFailed = true)  // every song, saved again
+                }
+                refresh()
+            }
 
             override fun onRequirementsStateChanged(
                 downloadManager: DownloadManager,
@@ -428,6 +442,7 @@ object Offline {
      */
     fun sync(context: Context, categories: List<Category>, retryFailed: Boolean = false) {
         val app = context.applicationContext
+        this.library = categories
         val library = categories.flatMapTo(HashSet()) { category -> category.songs.map { it.videoId } }
         val manager = manager(app)
         val store = cache(app)
@@ -636,16 +651,44 @@ object Offline {
         send { DownloadService.sendSetRequirements(app, SongDownloadService::class.java, savingRules(app), false) }
     }
 
-    /** Frees the space: removes every saved song, and stops saving until it's turned back on. */
-    fun deleteSaved(context: Context) {
+    /**
+     * Clears the cache: every stored song (saved, or partly played), song images, and the
+     * remembered stream addresses. With [resave], every song is then saved again in the format
+     * and quality chosen now; without it, automatic saving turns off so they stay deleted.
+     * Main thread.
+     */
+    fun clearCache(context: Context, categories: List<Category>, resave: Boolean) {
         val app = context.applicationContext
-        preferences(app).edit().putBoolean("save", false).apply()
-        setPinned(emptySet())
+        val prefs = preferences(app)
+        val editor = prefs.edit().putBoolean("save", resave)
+        for (key in prefs.all.keys) if (key.startsWith("origin_")) editor.remove(key)
+        editor.apply()
+        if (!resave) setPinned(emptySet())
+        library = categories
+        origins.clear()
+        restarts.clear()
+        startingOver.clear()
+        fromComputer.clear()
+        YouTube.forgetAll()
+        app.imageLoader.memoryCache?.clear()
         send { DownloadService.sendRemoveAllDownloads(app, SongDownloadService::class.java, false) }
         val store = cache(app)
         io.execute {
+            // Songs that were only played (not saved) aren't downloads: remove those here. The
+            // downloads are removed by the download manager; nothing is re-saved until both are done.
             for (key in store.keys.toList()) runCatching { store.removeResource(key) }
-            main.post { refresh() }
+            runCatching { app.imageLoader.diskCache?.clear() }
+            main.post {
+                if (resave) {
+                    resaveWhenIdle = true
+                    val manager = manager(app)
+                    if (manager.isIdle && manager.currentDownloads.isEmpty()) {
+                        resaveWhenIdle = false
+                        sync(app, categories, retryFailed = true)
+                    }
+                }
+                refresh()
+            }
         }
     }
 
