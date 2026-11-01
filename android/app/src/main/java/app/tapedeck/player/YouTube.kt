@@ -39,9 +39,20 @@ object YouTube {
         }
     }
 
-    /** The best audio-only stream for a song. Runs on a background thread (the player's loader). */
-    fun audioUrl(videoId: String): String {
-        found[videoId]?.let { if (System.currentTimeMillis() - it.at < STREAM_LIFETIME_MS) return it.url }
+    /** YouTube no longer offers the format a partly saved copy began in, so it can't be finished. */
+    class FormatGone(message: String) : IOException(message)
+
+    fun itagOf(url: String): String? = Uri.parse(url).getQueryParameter("itag")
+
+    /**
+     * The best audio-only stream for a song, on a background thread (the player's loader).
+     * With [itag], exactly that format, so a partly saved copy is finished with the same bytes.
+     */
+    fun audioUrl(videoId: String, itag: String? = null): String {
+        found[videoId]?.let {
+            val fresh = System.currentTimeMillis() - it.at < STREAM_LIFETIME_MS
+            if (fresh && (itag == null || itagOf(it.url) == itag)) return it.url
+        }
         start()
         val info = try {
             StreamInfo.getInfo("https://www.youtube.com/watch?v=$videoId")
@@ -50,12 +61,14 @@ object YouTube {
         } catch (e: Exception) {
             throw IOException(e.message ?: "YouTube wouldn't play this song", e)
         }
-        val best = info.audioStreams
-            .filter { it.deliveryMethod == DeliveryMethod.PROGRESSIVE_HTTP && it.isUrl }
-            .maxByOrNull { it.averageBitrate }
-            ?: throw IOException("YouTube didn't offer audio for this song")
-        found[videoId] = Found(best.content, System.currentTimeMillis())
-        return best.content
+        val streams = info.audioStreams.filter { it.deliveryMethod == DeliveryMethod.PROGRESSIVE_HTTP && it.isUrl }
+        val chosen = if (itag != null) {
+            streams.firstOrNull { itagOf(it.content) == itag } ?: throw FormatGone("That format of the song is gone")
+        } else {
+            streams.maxByOrNull { it.averageBitrate } ?: throw IOException("YouTube didn't offer audio for this song")
+        }
+        found[videoId] = Found(chosen.content, System.currentTimeMillis())
+        return chosen.content
     }
 
     /** After a playback error, look the song up fresh next time. */
@@ -147,6 +160,7 @@ object Importer {
         val result = store.importCode(code)
         Tapedeck.fillInDetails(store)
         Offline.syncSoon(store)
+        if (fromComputer > 0) Offline.switchToComputer()  // songs partway through from YouTube
         val parts = ArrayList<String>()
         if (result.added > 0) parts.add("added ${result.added} ${if (result.added == 1) "category" else "categories"}")
         if (result.updated > 0) parts.add("updated ${result.updated}")

@@ -409,7 +409,8 @@ private fun LibraryScreen(
                 }
                 if (status.total > 0) {
                     item {
-                        SavingPanel(status, notificationsOn = notificationsOn, onNotifications = onNotifications,
+                        SavingPanel(status, onScan = onImport, notificationsOn = notificationsOn,
+                            onNotifications = onNotifications,
                             onAllowMobileData = { onMobileData(true) }, onTurnOn = { onSaving(true) },
                             onTryAgain = onTryAgain)
                     }
@@ -427,6 +428,7 @@ private fun LibraryScreen(
 @Composable
 private fun SavingPanel(
     status: SaveStatus,
+    onScan: () -> Unit,
     notificationsOn: Boolean,
     onNotifications: () -> Unit,
     onAllowMobileData: () -> Unit,
@@ -461,12 +463,15 @@ private fun SavingPanel(
                 color = accent,
                 trackColor = Line,
             )
-            val source = if (status.fromComputer) "from your computer" else "from YouTube"
+            val sources = buildList {
+                if (status.computerSpeed > 0) add("from your computer at ${formatSpeed(status.computerSpeed)}")
+                if (status.youtubeSpeed > 0) add("from YouTube at ${formatSpeed(status.youtubeSpeed)}")
+            }
             val detail = when {
                 !status.enabled -> "Saving is off."
                 status.waitingForNetwork -> "Waiting for an internet connection."
                 status.waitingForWifi -> "Waiting for Wi-Fi."
-                status.bytesPerSecond > 0 -> "Copying $source at ${formatSpeed(status.bytesPerSecond)}."
+                sources.isNotEmpty() -> "Copying ${sources.joinToString(" and ")}."
                 else -> "Saved songs play offline; the rest stream meanwhile."
             }
             Text("$detail ${formatBytes(status.bytes)} used.", color = Smoke, style = MaterialTheme.typography.bodySmall)
@@ -474,6 +479,11 @@ private fun SavingPanel(
                 TextButton(onClick = onTurnOn) { Text("Turn saving on") }
             } else if (status.waitingForWifi && !status.waitingForNetwork) {
                 TextButton(onClick = onAllowMobileData) { Text("Use mobile data too") }
+            } else if (status.youtubeSpeed > 0 && !status.computerConnected) {
+                Text("Songs saved on your computer copy much faster from there: open Copy to your " +
+                    "phone on it, then scan its code.", color = Smoke,
+                    style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 4.dp))
+                TextButton(onClick = onScan) { Text("Scan the computer's code") }
             } else if (!notificationsOn) {
                 Text("Notifications are off, so progress only shows here.", color = Smoke,
                     style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 4.dp))

@@ -51,6 +51,9 @@ data class SaveStatus(
     val fromComputer: Boolean = false,
     val downloading: Int = 0,
     val queued: Int = 0,
+    val computerSpeed: Double = 0.0,
+    val youtubeSpeed: Double = 0.0,
+    val computerConnected: Boolean = false,
 )
 
 /**
@@ -66,6 +69,7 @@ data class SaveStatus(
  */
 @OptIn(UnstableApi::class)
 object Offline {
+    private const val ORIGIN_COMPUTER = "pc"  // YouTube origins are "yt:<format>"
     private val io = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
     private var databaseInstance: StandaloneDatabaseProvider? = null
@@ -89,6 +93,12 @@ object Offline {
 
     /** The last few songs that couldn't be saved, and why (for Settings' saving details). */
     private val problems = ArrayDeque<String>()
+
+    // Where each partly stored song came from. The rest must come from the same place, or the
+    // saved file would be two different files glued together. Kept across restarts.
+    private val origins = ConcurrentHashMap<String, String>()
+    private val startingOver: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    private val restarts = ConcurrentHashMap<String, Int>()
     private val fromComputer: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private val computerFailed: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private val quick = YouTube.http.newBuilder()
@@ -100,6 +110,10 @@ object Offline {
     private val lastBytes = HashMap<String, Long>()
     private var lastSampleAt = 0L
     private var bytesPerSecond = 0.0
+    private var computerSpeed = 0.0
+    private var youtubeSpeed = 0.0
+    private var finishedFromComputer = 0L  // bytes of songs that finished between two samples
+    private var finishedFromYouTube = 0L
 
     @Volatile
     private var wanted: Set<String> = emptySet()
@@ -126,16 +140,91 @@ object Offline {
     }
 
     /** Where audio comes from: a song's YouTube link turns into its audio stream when needed. */
-    fun upstream(): DataSource.Factory =
-        ResolvingDataSource.Factory(OkHttpDataSource.Factory(YouTube.http)) { spec -> resolve(spec) }
+    fun upstream(): DataSource.Factory {
+        val network = OkHttpDataSource.Factory(YouTube.http)
+        // YouTube streams are read in bounded pieces, which YouTube serves at full speed.
+        val pieces = DataSource.Factory { ChunkedDataSource(network.createDataSource()) }
+        return ResolvingDataSource.Factory(pieces) { spec -> resolve(spec) }
+    }
 
     private fun resolve(spec: DataSpec): DataSpec {
         val uri = spec.uri
         val videoId = uri.getQueryParameter("v")
         if (uri.host != "www.youtube.com" || videoId == null) return spec
-        computerLink(videoId)?.let { return spec.withUri(Uri.parse(it)) }
-        val url = YouTube.audioUrl(videoId)
+        // Part of the song may be stored already: the rest has to come from the same place.
+        val resuming = spec.position > 0
+        val before = if (resuming) originOf(videoId) else null
+        if (resuming && before == null) startOver(videoId)  // stored by an older version, source unknown
+        if (before == null || before == ORIGIN_COMPUTER) {
+            computerLink(videoId)?.let { link ->
+                if (!resuming) setOrigin(videoId, ORIGIN_COMPUTER)
+                return spec.withUri(Uri.parse(link))
+            }
+            if (before == ORIGIN_COMPUTER) startOver(videoId)  // the computer isn't offering it any more
+        }
+        val url = try {
+            YouTube.audioUrl(videoId, before?.removePrefix("yt:"))
+        } catch (e: YouTube.FormatGone) {
+            startOver(videoId)
+        }
+        if (!resuming) setOrigin(videoId, "yt:" + (YouTube.itagOf(url) ?: "?"))
         return spec.withUri(Uri.parse(url)).withAdditionalHeaders(YouTube.streamHeaders(url))
+    }
+
+    private fun originOf(id: String): String? =
+        origins[id] ?: preferencesInstance?.getString("origin_$id", null)?.also { origins[id] = it }
+
+    private fun setOrigin(id: String, origin: String) {
+        origins[id] = origin
+        preferencesInstance?.edit()?.putString("origin_$id", origin)?.apply()
+    }
+
+    private fun clearOrigin(id: String) {
+        origins.remove(id)
+        preferencesInstance?.edit()?.remove("origin_$id")?.apply()
+    }
+
+    /** The stored part came from somewhere else: fail this attempt, so it starts over cleanly. */
+    private fun startOver(videoId: String): Nothing {
+        fromComputer.remove(videoId)
+        startingOver.add(videoId)
+        throw IOException("Starting this song over, from a different source")
+    }
+
+    /** Throws away a song's partly saved copy and saves it again from the start. Main thread. */
+    private fun saveAgainFromStart(app: Context, id: String) {
+        val attempts = (restarts[id] ?: 0) + 1
+        restarts[id] = attempts
+        if (attempts > 3) return  // keeps failing: leave it failed (Try again restarts it)
+        clearOrigin(id)
+        val store = cacheInstance ?: return
+        io.execute {
+            runCatching { store.removeResource(keyOf(id)) }
+            main.post { send { DownloadService.sendAddDownload(app, SongDownloadService::class.java, request(id), false) } }
+        }
+    }
+
+    private fun keyOf(id: String) = "https://www.youtube.com/watch?v=$id"
+
+    /**
+     * After a scan: songs partly saved from YouTube start over from the computer, which sends
+     * them far faster. Songs that haven't started pick the computer by themselves. Any thread.
+     */
+    fun switchToComputer() {
+        val source = computer ?: return
+        main.post {
+            val app = appContext ?: return@post
+            val manager = managerInstance ?: return@post
+            for (download in manager.currentDownloads) {
+                val id = download.request.id
+                if (id in source.songs && originOf(id)?.startsWith("yt:") == true) {
+                    restarts.remove(id)
+                    clearOrigin(id)
+                    send { DownloadService.sendRemoveDownload(app, SongDownloadService::class.java, id, false) }
+                    send { DownloadService.sendAddDownload(app, SongDownloadService::class.java, request(id), false) }
+                }
+            }
+        }
     }
 
     /**
@@ -215,7 +304,7 @@ object Offline {
         managerInstance?.let { return it }
         val app = context.applicationContext
         val created = DownloadManager(app, database(app), cache(app), upstream(), Executors.newFixedThreadPool(2))
-        created.maxParallelDownloads = 2  // gentle on YouTube
+        created.maxParallelDownloads = 3  // quick, and still gentle on YouTube
         created.requirements = savingRules(app)
         created.addListener(object : DownloadManager.Listener {
             override fun onInitialized(downloadManager: DownloadManager) = refresh()
@@ -227,15 +316,24 @@ object Offline {
             ) {
                 val id = download.request.id
                 if (download.state == Download.STATE_FAILED) {
-                    problems.addLast("$id: ${finalException?.message ?: "failed"}")
-                    while (problems.size > 8) problems.removeFirst()
-                }
-                if (download.state == Download.STATE_FAILED && fromComputer.remove(id)) {
-                    // The computer stopped sending (its window closed?): get this one from YouTube.
-                    computerFailed.add(id)
-                    send { DownloadService.sendAddDownload(app, SongDownloadService::class.java, request(id), false) }
+                    val switching = startingOver.remove(id)
+                    val computerQuit = fromComputer.remove(id)
+                    // The computer stopped sending (its window closed?): YouTube for this one now.
+                    if (computerQuit && !switching) computerFailed.add(id)
+                    if (switching || computerQuit) {
+                        saveAgainFromStart(app, id)  // from the start, so the two sources never mix
+                    } else {
+                        problems.addLast("$id: ${finalException?.message ?: "failed"}")
+                        while (problems.size > 8) problems.removeFirst()
+                    }
                 } else if (download.state == Download.STATE_COMPLETED) {
+                    // Count the part not seen by a speed sample yet (fast songs finish in between).
+                    val counted = lastBytes.remove(id) ?: 0L
+                    val rest = (download.bytesDownloaded - counted).coerceAtLeast(0L)
+                    if (originOf(id) == ORIGIN_COMPUTER) finishedFromComputer += rest else finishedFromYouTube += rest
                     fromComputer.remove(id)
+                    restarts.remove(id)
+                    clearOrigin(id)
                 }
                 refresh()
             }
@@ -267,6 +365,7 @@ object Offline {
         val enabled = savingEnabled(app)
         val retry = retryFailed || firstSync
         firstSync = false
+        if (retry) restarts.clear()  // songs that gave up get their fresh starts back
         io.execute {
             val known = HashMap<String, Int>()
             runCatching {
@@ -308,26 +407,38 @@ object Offline {
     fun tick() {
         val manager = managerInstance ?: return
         val now = SystemClock.elapsedRealtime()
-        var received = 0L
+        var fromPc = finishedFromComputer
+        var fromYt = finishedFromYouTube
+        finishedFromComputer = 0L
+        finishedFromYouTube = 0L
         val seen = HashSet<String>()
         for (download in manager.currentDownloads) {
             val id = download.request.id
             seen.add(id)
             val bytes = download.bytesDownloaded
             val before = lastBytes[id]
-            if (before != null && bytes > before) received += bytes - before
+            if (before != null && bytes > before) {
+                if (originOf(id) == ORIGIN_COMPUTER) fromPc += bytes - before else fromYt += bytes - before
+            }
             lastBytes[id] = bytes
         }
         lastBytes.keys.retainAll(seen)
         val elapsed = now - lastSampleAt
         if (lastSampleAt > 0L && elapsed in 1L..10_000L) {
-            val instant = received * 1000.0 / elapsed
-            bytesPerSecond = if (bytesPerSecond == 0.0) instant else bytesPerSecond * 0.5 + instant * 0.5
+            computerSpeed = smooth(computerSpeed, fromPc * 1000.0 / elapsed)
+            youtubeSpeed = smooth(youtubeSpeed, fromYt * 1000.0 / elapsed)
         }
         lastSampleAt = now
-        if (seen.isEmpty()) bytesPerSecond = 0.0
+        if (seen.isEmpty() && fromPc == 0L && fromYt == 0L) {
+            computerSpeed = 0.0
+            youtubeSpeed = 0.0
+        }
+        bytesPerSecond = computerSpeed + youtubeSpeed
         refresh()
     }
+
+    private fun smooth(previous: Double, latest: Double): Double =
+        if (previous == 0.0) latest else previous * 0.5 + latest * 0.5
 
     /** Recomputes what the progress bar shows. Main thread (it reads live download progress). */
     fun refresh() {
@@ -337,8 +448,11 @@ object Offline {
         val live = manager.currentDownloads.associateBy { it.request.id }
         val enabled = preferencesInstance?.getBoolean("save", true) ?: true
         val ids = wanted
-        val speed = if (live.isEmpty()) 0.0 else bytesPerSecond
+        val speed = bytesPerSecond
         val copying = computer != null && fromComputer.isNotEmpty()
+        val fromPcSpeed = computerSpeed
+        val fromYtSpeed = youtubeSpeed
+        val connected = computer != null
         if (enabled && manager.downloadsPaused) {  // should never stay paused while saving is on
             appContext?.let { app -> send { DownloadService.sendResumeDownloads(app, SongDownloadService::class.java, false) } }
         }
@@ -389,6 +503,9 @@ object Offline {
                 fromComputer = copying,
                 downloading = downloading,
                 queued = queued,
+                computerSpeed = fromPcSpeed,
+                youtubeSpeed = fromYtSpeed,
+                computerConnected = connected,
             )
         }
     }
@@ -416,8 +533,8 @@ object Offline {
             appendLine("Notifications: ${if (notificationsOn) "on" else "off"}")
             appendLine("Computer: " + if (source == null) "not connected" else
                 "${source.base} (${source.songs.size} songs offered, ${fromComputer.size} coming now)")
-            appendLine("Speed: ${if (state.bytesPerSecond > 0) formatSpeed(state.bytesPerSecond) else "idle"}; " +
-                "stored: ${formatBytes(state.bytes)}")
+            appendLine("Speed: from the computer ${formatSpeed(state.computerSpeed)}, from YouTube " +
+                "${formatSpeed(state.youtubeSpeed)}; stored: ${formatBytes(state.bytes)}")
             if (problems.isNotEmpty()) {
                 appendLine("Recent problems:")
                 for (problem in problems) appendLine("  $problem")
@@ -456,7 +573,7 @@ object Offline {
     }
 
     private fun request(videoId: String): DownloadRequest {
-        val link = "https://www.youtube.com/watch?v=$videoId"
+        val link = keyOf(videoId)
         return DownloadRequest.Builder(videoId, Uri.parse(link)).setCustomCacheKey(link).build()
     }
 

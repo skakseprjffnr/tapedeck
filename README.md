@@ -143,10 +143,10 @@ open its **Actions** tab, choose **Windows build** and click **Run workflow**.
 After about ten minutes, download **Tapedeck-windows** from the run's
 Artifacts. It contains:
 
-- `Tapedeck-0.9.1-windows-setup.exe`, an installer that needs no admin rights
-- `Tapedeck-0.9.1-windows-portable.zip`, which runs from any folder
+- `Tapedeck-0.9.2-windows-setup.exe`, an installer that needs no admin rights
+- `Tapedeck-0.9.2-windows-portable.zip`, which runs from any folder
 
-Pushing a tag such as `v0.9.1` builds the same files (and the Android app) and
+Pushing a tag such as `v0.9.2` builds the same files (and the Android app) and
 attaches them to that release, which makes them easy to share.
 
 **On a Windows PC.** Install Python 3.11 or newer, plus Inno Setup 6 if you
@@ -192,6 +192,11 @@ start instantly and work offline, and the rest stream.
 
 - Saving uses Wi-Fi only, unless you allow mobile data in Settings (each song
   is about 3 to 5 MB). Without Wi-Fi the bar says it's waiting.
+- Copying from your computer is the fastest way. If songs are coming from
+  YouTube, the panel suggests scanning your computer's code; songs partway
+  through then switch over and finish from the computer.
+- From YouTube, songs are fetched in pieces of up to 8 MB, the way YouTube's own
+  player does it: YouTube slows a single open-ended download to a crawl.
 - It keeps going with the screen off, and picks up where it left off if the
   app or the phone restarts.
 - Songs you remove, here or by sending an updated library, are deleted from
