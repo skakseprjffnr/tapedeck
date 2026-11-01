@@ -1,8 +1,11 @@
 package app.tapedeck.player
 
 import android.Manifest
+import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
+import android.provider.Settings as AndroidSettings
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -94,6 +97,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
@@ -161,6 +165,14 @@ private fun Player.snapshot(): PlayerUi {
     )
 }
 
+/** Tapedeck's page in the phone's notification settings. */
+private fun openNotificationSettings(context: Context) {
+    val intent = Intent(AndroidSettings.ACTION_APP_NOTIFICATION_SETTINGS)
+        .putExtra(AndroidSettings.EXTRA_APP_PACKAGE, context.packageName)
+        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    runCatching { context.startActivity(intent) }
+}
+
 private fun accentColor(hex: String): Color = try {
     Color(android.graphics.Color.parseColor(hex))
 } catch (e: IllegalArgumentException) {
@@ -215,6 +227,9 @@ fun TapedeckApp(store: LibraryStore, controller: MediaController?) {
     val status by Offline.status.collectAsState()
     val saved by Offline.saved.collectAsState()
     var mobileData by remember { mutableStateOf(Offline.mobileDataAllowed(context)) }
+    // Checked on every recomposition (each second while saving), so coming back from the
+    // phone's settings shows the change.
+    val notificationsOn = NotificationManagerCompat.from(context).areNotificationsEnabled()
 
     // Every song in the library gets saved; removed ones are forgotten. Titles filling in
     // don't change the set, so they don't trigger this.
@@ -258,6 +273,8 @@ fun TapedeckApp(store: LibraryStore, controller: MediaController?) {
                             onImport = { screen = Screen.Import },
                             onPlay = { category, shuffle -> playCategory(controller, category, null, shuffle) },
                             onSettings = { screen = Screen.Settings },
+                            notificationsOn = notificationsOn,
+                            onNotifications = { openNotificationSettings(context) },
                             onSaving = { on -> Offline.setSaving(context, on, store.categories.value) },
                             onMobileData = { allowed ->
                                 mobileData = allowed
@@ -298,6 +315,8 @@ fun TapedeckApp(store: LibraryStore, controller: MediaController?) {
                                     Offline.setMobileData(context, allowed)
                                 },
                                 onDeleteSaved = { Offline.deleteSaved(context) },
+                                notificationsOn = notificationsOn,
+                                onNotifications = { openNotificationSettings(context) },
                             )
                         }
                     }
@@ -340,6 +359,8 @@ private fun LibraryScreen(
     onImport: () -> Unit,
     onPlay: (Category, Boolean) -> Unit,
     onSettings: () -> Unit,
+    notificationsOn: Boolean,
+    onNotifications: () -> Unit,
     onSaving: (Boolean) -> Unit,
     onMobileData: (Boolean) -> Unit,
     onTryAgain: () -> Unit,
@@ -388,8 +409,9 @@ private fun LibraryScreen(
                 }
                 if (status.total > 0) {
                     item {
-                        SavingPanel(status, onAllowMobileData = { onMobileData(true) },
-                            onTurnOn = { onSaving(true) }, onTryAgain = onTryAgain)
+                        SavingPanel(status, notificationsOn = notificationsOn, onNotifications = onNotifications,
+                            onAllowMobileData = { onMobileData(true) }, onTurnOn = { onSaving(true) },
+                            onTryAgain = onTryAgain)
                     }
                 }
                 items(categories, key = { it.id }) { category ->
@@ -403,7 +425,14 @@ private fun LibraryScreen(
 
 /** How far along saving is: a progress bar until every song is on the phone. */
 @Composable
-private fun SavingPanel(status: SaveStatus, onAllowMobileData: () -> Unit, onTurnOn: () -> Unit, onTryAgain: () -> Unit) {
+private fun SavingPanel(
+    status: SaveStatus,
+    notificationsOn: Boolean,
+    onNotifications: () -> Unit,
+    onAllowMobileData: () -> Unit,
+    onTurnOn: () -> Unit,
+    onTryAgain: () -> Unit,
+) {
     val accent = MaterialTheme.colorScheme.primary
     Column(
         Modifier
@@ -445,6 +474,10 @@ private fun SavingPanel(status: SaveStatus, onAllowMobileData: () -> Unit, onTur
                 TextButton(onClick = onTurnOn) { Text("Turn saving on") }
             } else if (status.waitingForWifi && !status.waitingForNetwork) {
                 TextButton(onClick = onAllowMobileData) { Text("Use mobile data too") }
+            } else if (!notificationsOn) {
+                Text("Notifications are off, so progress only shows here.", color = Smoke,
+                    style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 4.dp))
+                TextButton(onClick = onNotifications) { Text("Show progress in notifications") }
             }
             if (status.failed > 0) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -852,7 +885,11 @@ private fun SettingsScreen(
     onSaving: (Boolean) -> Unit,
     onMobileData: (Boolean) -> Unit,
     onDeleteSaved: () -> Unit,
+    notificationsOn: Boolean,
+    onNotifications: () -> Unit,
 ) {
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
     val accentHex by store.accent.collectAsState()
     val matchComputer by store.matchComputer.collectAsState()
     var typed by remember { mutableStateOf(accentHex) }
@@ -964,9 +1001,23 @@ private fun SettingsScreen(
                 checked = mobileData,
                 onChange = onMobileData,
             )
-            Text("${formatBytes(status.bytes)} used by saved songs.", color = Smoke,
-                style = MaterialTheme.typography.bodySmall)
-            OutlinedButton(onClick = { confirmDelete = true }) { Text("Delete saved songs", color = Danger) }
+            SettingSwitch(
+                title = "Progress notification",
+                detail = if (notificationsOn) "Shows how saving is going while the app is closed."
+                else "Off in your phone's settings. Tap to turn it on there.",
+                checked = notificationsOn,
+                onChange = { onNotifications() },
+            )
+            Text("${formatBytes(status.bytes)} used by saved songs. ${status.saved} of ${status.total} " +
+                "saved, ${status.downloading} saving now, ${status.queued} waiting, ${status.failed} failed.",
+                color = Smoke, style = MaterialTheme.typography.bodySmall)
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedButton(onClick = {
+                    clipboard.setText(AnnotatedString(Offline.report(notificationsOn)))
+                    Toast.makeText(context, "Saving details copied", Toast.LENGTH_SHORT).show()
+                }) { Text("Copy saving details") }
+                OutlinedButton(onClick = { confirmDelete = true }) { Text("Delete saved songs", color = Danger) }
+            }
             Spacer(Modifier.height(12.dp))
         }
     }

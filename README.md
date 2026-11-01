@@ -143,10 +143,10 @@ open its **Actions** tab, choose **Windows build** and click **Run workflow**.
 After about ten minutes, download **Tapedeck-windows** from the run's
 Artifacts. It contains:
 
-- `Tapedeck-0.9.0-windows-setup.exe`, an installer that needs no admin rights
-- `Tapedeck-0.9.0-windows-portable.zip`, which runs from any folder
+- `Tapedeck-0.9.1-windows-setup.exe`, an installer that needs no admin rights
+- `Tapedeck-0.9.1-windows-portable.zip`, which runs from any folder
 
-Pushing a tag such as `v0.9.0` builds the same files (and the Android app) and
+Pushing a tag such as `v0.9.1` builds the same files (and the Android app) and
 attaches them to that release, which makes them easy to share.
 
 **On a Windows PC.** Install Python 3.11 or newer, plus Inno Setup 6 if you
@@ -197,6 +197,11 @@ start instantly and work offline, and the rest stream.
 - Songs you remove, here or by sending an updated library, are deleted from
   the phone.
 - Settings also turns saving off, or deletes every saved song to free space.
+- Progress shows in a notification only if Tapedeck may show notifications. If
+  you said no when it asked, the saving panel has a shortcut to turn them on.
+- If saving ever seems stuck, open Settings and tap **Copy saving details**. It
+  lists what's saving, what it's waiting for, and any errors, ready to paste
+  wherever you're asking for help.
 
 ### Settings
 

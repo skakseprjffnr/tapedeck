@@ -49,6 +49,8 @@ data class SaveStatus(
     val active: Boolean = false,
     val bytesPerSecond: Double = 0.0,
     val fromComputer: Boolean = false,
+    val downloading: Int = 0,
+    val queued: Int = 0,
 )
 
 /**
@@ -81,6 +83,12 @@ object Offline {
 
     @Volatile
     private var computerCheckedAt = 0L
+
+    @Volatile
+    private var computerRetryAt = 0L
+
+    /** The last few songs that couldn't be saved, and why (for Settings' saving details). */
+    private val problems = ArrayDeque<String>()
     private val fromComputer: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private val computerFailed: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private val quick = YouTube.http.newBuilder()
@@ -155,6 +163,7 @@ object Offline {
         if (offered.isEmpty()) return 0
         computerFailed.clear()
         computerCheckedAt = System.currentTimeMillis()
+        computerRetryAt = 0L
         computer = Computer(base, token, offered)
         return offered.size
     }
@@ -164,17 +173,21 @@ object Offline {
         val source = computer ?: return null
         if (videoId !in source.songs || videoId in computerFailed) return null
         val link = "${source.base}/a/${source.token}/$videoId"
-        if (System.currentTimeMillis() - computerCheckedAt > 10_000) {  // still there? a quick question
+        val now = System.currentTimeMillis()
+        if (now < computerRetryAt) return null  // it didn't answer a moment ago: YouTube for now
+        if (now - computerCheckedAt > 10_000) {  // still there? a quick question
             val reachable = try {
                 quick.newCall(okhttp3.Request.Builder().url(link).head().build()).execute().use { it.isSuccessful }
             } catch (e: IOException) {
                 false
             }
             if (!reachable) {
-                computer = null
+                // Ask again shortly: one missed answer on busy Wi-Fi shouldn't send every
+                // remaining song to YouTube.
+                computerRetryAt = now + 20_000
                 return null
             }
-            computerCheckedAt = System.currentTimeMillis()
+            computerCheckedAt = now
         }
         fromComputer.add(videoId)
         return link
@@ -213,6 +226,10 @@ object Offline {
                 finalException: Exception?,
             ) {
                 val id = download.request.id
+                if (download.state == Download.STATE_FAILED) {
+                    problems.addLast("$id: ${finalException?.message ?: "failed"}")
+                    while (problems.size > 8) problems.removeFirst()
+                }
                 if (download.state == Download.STATE_FAILED && fromComputer.remove(id)) {
                     // The computer stopped sending (its window closed?): get this one from YouTube.
                     computerFailed.add(id)
@@ -276,6 +293,9 @@ object Offline {
                             send { DownloadService.sendAddDownload(app, SongDownloadService::class.java, request(id), false) }
                         }
                     }
+                    // The download manager starts out paused, and only the saving service resumes
+                    // it. Songs queued before the app restarted wait for that, so start it now.
+                    send { DownloadService.sendResumeDownloads(app, SongDownloadService::class.java, false) }
                 } else {
                     send { DownloadService.sendPauseDownloads(app, SongDownloadService::class.java, false) }
                 }
@@ -319,6 +339,9 @@ object Offline {
         val ids = wanted
         val speed = if (live.isEmpty()) 0.0 else bytesPerSecond
         val copying = computer != null && fromComputer.isNotEmpty()
+        if (enabled && manager.downloadsPaused) {  // should never stay paused while saving is on
+            appContext?.let { app -> send { DownloadService.sendResumeDownloads(app, SongDownloadService::class.java, false) } }
+        }
         io.execute {
             val all = HashMap<String, Download>()
             runCatching {
@@ -332,6 +355,8 @@ object Offline {
             all.putAll(live)  // the index only updates on state changes; these have live progress
             var done = 0
             var failed = 0
+            var downloading = 0
+            var queued = 0
             var partial = 0f
             val savedIds = HashSet<String>()
             for (id in ids) {
@@ -342,7 +367,11 @@ object Offline {
                         savedIds.add(id)
                     }
                     Download.STATE_FAILED -> failed += 1
-                    Download.STATE_DOWNLOADING -> partial += download.percentDownloaded.coerceAtLeast(0f) / 100f
+                    Download.STATE_DOWNLOADING -> {
+                        downloading += 1
+                        partial += download.percentDownloaded.coerceAtLeast(0f) / 100f
+                    }
+                    Download.STATE_QUEUED -> queued += 1
                 }
             }
             _saved.value = savedIds
@@ -358,8 +387,42 @@ object Offline {
                 active = live.isNotEmpty(),
                 bytesPerSecond = speed,
                 fromComputer = copying,
+                downloading = downloading,
+                queued = queued,
             )
         }
+    }
+
+    /** Where saving stands, as text to copy and paste when something seems stuck. Main thread. */
+    fun report(notificationsOn: Boolean): String {
+        val state = _status.value
+        val manager = managerInstance
+        val notMet = manager?.notMetRequirements ?: 0
+        val source = computer
+        val waitingFor = when {
+            (notMet and Requirements.NETWORK) != 0 -> "an internet connection"
+            (notMet and Requirements.NETWORK_UNMETERED) != 0 -> "Wi-Fi (this network counts as mobile data)"
+            notMet != 0 -> "something else ($notMet)"
+            else -> "nothing"
+        }
+        return buildString {
+            appendLine("Tapedeck saving details")
+            appendLine("Songs: ${state.total}; saved ${state.saved}, saving ${state.downloading}, " +
+                "waiting ${state.queued}, failed ${state.failed}")
+            appendLine("Saving: ${if (state.enabled) "on" else "off"}; mobile data: " +
+                "${if (preferencesInstance?.getBoolean("mobile", false) == true) "allowed" else "not allowed"}; " +
+                "paused: ${if (manager?.downloadsPaused == true) "yes" else "no"}")
+            appendLine("Waiting for: $waitingFor")
+            appendLine("Notifications: ${if (notificationsOn) "on" else "off"}")
+            appendLine("Computer: " + if (source == null) "not connected" else
+                "${source.base} (${source.songs.size} songs offered, ${fromComputer.size} coming now)")
+            appendLine("Speed: ${if (state.bytesPerSecond > 0) formatSpeed(state.bytesPerSecond) else "idle"}; " +
+                "stored: ${formatBytes(state.bytes)}")
+            if (problems.isNotEmpty()) {
+                appendLine("Recent problems:")
+                for (problem in problems) appendLine("  $problem")
+            }
+        }.trimEnd()
     }
 
     fun setSaving(context: Context, on: Boolean, categories: List<Category>) {

@@ -66,7 +66,7 @@ from PySide6.QtWidgets import (
 APP_NAME = "Tapedeck"
 APP_ID = "tapedeck"
 IS_WINDOWS = sys.platform == "win32"
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 
 # ── Design tokens ────────────────────────────────────────────────────────────
 # Strict black and white. The accent only marks actions and what is playing.
@@ -1686,6 +1686,9 @@ class PhoneTransfer(QObject):
         return (last_total - first_total) / max(last_time - first_time, 0.25)
 
     def close(self) -> None:
+        if self.wanted:
+            log.info("Phone transfer closed: sent %d of %d songs",
+                     len(self.done & self.wanted), len(self.wanted))
         self.server.close()
         for connection in list(self._connections.values()):
             connection.socket.abort()
@@ -1740,6 +1743,9 @@ class PhoneTransfer(QObject):
 
     def _route(self, connection: _Connection, method: str, path: str, headers: dict, body: bytes) -> None:
         token = self.token
+        shown = path.replace(token, "…") if token else path  # the log never shows the secret part
+        log.info("Phone: %s %s%s", method, shown,
+                 f" ({headers['range']})" if "range" in headers else "")
         if path == f"/t/{token}" and method in ("GET", "HEAD"):
             self._reply(connection, "200 OK", self.body, head_only=method == "HEAD")
             if method == "GET":
@@ -1835,6 +1841,8 @@ class PhoneTransfer(QObject):
         connection.handle = None
         if complete and connection.to_end:
             self.done.add(connection.video_id)
+            log.info("Phone: received %s (%d of %d)", connection.video_id,
+                     len(self.done & self.wanted), len(self.wanted))
             self.progressed.emit()
         socket.disconnectFromHost()  # after everything queued has gone out
 
@@ -6190,6 +6198,23 @@ def membership_summary(library: Library, added: list[str], removed: list[str]) -
     return ", and ".join(parts) + "."
 
 
+def wrapped_label(text: str, name: str, font: QFont, width: int, lines: int = 0) -> QLabel:
+    """A word-wrapped label sized for the width it will actually get.
+
+    Qt sizes wrapped labels for a width it guesses; beside other widgets the real width is
+    narrower, and the text gets squeezed into lines that overlap. lines reserves room for
+    text that changes later.
+    """
+    label = plain_label(text, name, font)
+    label.setWordWrap(True)
+    needed = label.heightForWidth(width)
+    if lines:
+        needed = max(needed, QFontMetrics(font).lineSpacing() * lines)
+    if isinstance(needed, int) and needed > 0:
+        label.setMinimumHeight(needed)
+    return label
+
+
 class QrView(QWidget):
     """A QR code: dark modules on white, inside the quiet zone scanners need."""
 
@@ -6246,39 +6271,41 @@ class PhoneSheet(Sheet):
         self._library_sent = False
         songs = sum(len(category.song_ids) for category in library.categories)
         count = len(library.categories)
+        inner = z(460) - 2 * z(26)  # the prompt's width inside its margins
+        qr_size, gap = z(200), z(18)
+        # Beside the QR code, only the two short steps; the explanation runs full width below,
+        # where it has room. (Long text squeezed next to it is what made the lines overlap.)
         row = QHBoxLayout()
-        row.setSpacing(z(18))
+        row.setSpacing(gap)
         self.qr = QrView()
         row.addWidget(self.qr, 0, Qt.AlignmentFlag.AlignTop)
         steps = QVBoxLayout()
         steps.setSpacing(z(10))
         for text in ("1. Install Tapedeck on your Android phone (the APK in your GitHub release).",
-                     "2. Open it, tap Import, then Scan QR code.",
-                     f"Your {count} categor{'y' if count == 1 else 'ies'} and {song_count(songs)} "
-                     "are copied. Categories the phone already has from this computer are "
-                     "updated to match.",
-                     (f"The {song_count(len(saved))} saved on this computer are copied straight "
-                      "from here, which is much faster; keep this open until that's done. "
-                      if saved else "") +
-                     "Your phone gets the rest from YouTube."):
-            label = plain_label(text, "SheetText", make_font(13))
-            label.setWordWrap(True)
-            steps.addWidget(label)
+                     "2. Open it, tap Import, then Scan QR code."):
+            steps.addWidget(wrapped_label(text, "SheetText", make_font(13), inner - qr_size - gap))
         steps.addStretch(1)
         row.addLayout(steps, 1)
         self.body.addLayout(row)
-        self.status = plain_label("", "FieldHint", make_font(12))
-        self.status.setWordWrap(True)
+        about = (f"This copies your {count} categor{'y' if count == 1 else 'ies'} and "
+                 f"{song_count(songs)}; categories the phone already has from here are updated "
+                 "to match. ")
+        if saved:
+            about += (f"The {song_count(len(saved))} saved on this computer come straight from "
+                      "here, much faster than YouTube, so keep this open until they're sent.")
+        else:
+            about += "Your phone saves the songs from YouTube."
+        self.body.addWidget(wrapped_label(about, "SheetText", make_font(13), inner))
+        self.status = wrapped_label("", "FieldHint", make_font(12), inner, lines=2)
         self.body.addWidget(self.status)
         if self.transfer.url:
             self.qr.set_text(self.transfer.url)
-            self.status.setText("Your phone needs to be on the same Wi-Fi as this computer. If "
-                                "your computer asks whether Tapedeck may use the network, allow "
-                                "it. Otherwise, use Copy code and paste it into the app.")
+            self.status.setText("Your phone needs to be on the same Wi-Fi. If your computer asks "
+                                "whether Tapedeck may use the network, allow it.")
         else:
             self.qr.hide()
             self.status.setText("This computer isn't on a network your phone can reach. Use Copy "
-                                "code, send it to your phone, and paste it into the app's Import.")
+                                "code and paste it into the app's Import.")
 
     def _sent(self) -> None:
         self._library_sent = True
